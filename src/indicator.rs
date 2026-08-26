@@ -36,6 +36,7 @@ const HEIGHT: f64 = 24.0;
 const RIGHT_INSET: f64 = 12.0;
 const TOP_INSET: f64 = 3.0;
 const POSITION_TICKS: u8 = 8;
+const WISPR_DISMISS_TICKS: u8 = 23;
 
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -76,16 +77,37 @@ impl Phase {
     }
 }
 
+#[derive(Default)]
+struct Shared {
+    phase: AtomicU8,
+    wispr_dismiss_ticks: AtomicU8,
+}
+
 #[derive(Clone, Default)]
-pub struct Handle(Arc<AtomicU8>);
+pub struct Handle(Arc<Shared>);
 
 impl Handle {
     pub fn set(&self, phase: Phase) {
-        self.0.store(phase as u8, Ordering::Release);
+        self.0.phase.store(phase as u8, Ordering::Release);
+    }
+
+    pub fn dismiss_wispr_notification(&self) {
+        self.0
+            .wispr_dismiss_ticks
+            .store(WISPR_DISMISS_TICKS, Ordering::Release);
     }
 
     fn get(&self) -> Phase {
-        Phase::from_raw(self.0.load(Ordering::Acquire))
+        Phase::from_raw(self.0.phase.load(Ordering::Acquire))
+    }
+
+    fn wispr_dismiss_due(&self) -> bool {
+        self.0
+            .wispr_dismiss_ticks
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |ticks| {
+                if ticks > 0 { Some(ticks - 1) } else { None }
+            })
+            .is_ok_and(|ticks| ticks == 1)
     }
 }
 
@@ -163,6 +185,10 @@ impl Indicator {
     }
 
     fn refresh(&mut self) {
+        if self.handle.wispr_dismiss_due() {
+            crate::hotkey::dismiss_wispr_notification();
+        }
+
         let phase = self.handle.get();
         if self.phase != Some(phase) {
             self.set_phase(phase);
@@ -258,4 +284,21 @@ fn cmux_window_frame() -> Option<WindowFrame> {
 
 fn number(dictionary: &CFDictionary<CFString, CFType>, key: &CFString) -> Option<i64> {
     dictionary.find(key)?.downcast::<CFNumber>()?.to_i64()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Handle, WISPR_DISMISS_TICKS};
+
+    #[test]
+    fn dismisses_once_after_the_paste_failure_delay() {
+        let handle = Handle::default();
+        handle.dismiss_wispr_notification();
+
+        for _ in 1..WISPR_DISMISS_TICKS {
+            assert!(!handle.wispr_dismiss_due());
+        }
+        assert!(handle.wispr_dismiss_due());
+        assert!(!handle.wispr_dismiss_due());
+    }
 }

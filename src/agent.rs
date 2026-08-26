@@ -173,6 +173,7 @@ fn worker(receiver: Receiver<Event>, indicator: Indicator) {
             }
             Some(Event::Paste) => {
                 awaiting_transcript = false;
+                indicator.dismiss_wispr_notification();
                 let context = context.take().or_else(|| match cmux.context() {
                     Ok(context) => Some(context),
                     Err(error) => {

@@ -4,6 +4,7 @@ use core_graphics::event::{
     CGEvent, CGEventFlags, CGEventTap, CGEventTapLocation, CGEventTapOptions, CGEventTapPlacement,
     CGEventType, CallbackResult, EventField, KeyCode,
 };
+use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
 use std::{
     env, io,
     sync::{Arc, Mutex, mpsc::Sender},
@@ -11,6 +12,7 @@ use std::{
 };
 
 const PASTE_TIMEOUT: Duration = Duration::from_secs(15);
+const WISPR_DISMISS_MARKER: i64 = 0x4658_5749_5350_5201;
 
 #[link(name = "CoreGraphics", kind = "framework")]
 unsafe extern "C" {
@@ -77,10 +79,10 @@ pub fn listen(sender: Sender<Event>) -> Result<(), Box<dyn std::error::Error + S
         },
         move || {
             CGEventTap::with_enabled(
-                CGEventTapLocation::Session,
+                CGEventTapLocation::AnnotatedSession,
                 CGEventTapPlacement::HeadInsertEventTap,
                 CGEventTapOptions::Default,
-                vec![CGEventType::KeyDown],
+                vec![CGEventType::KeyDown, CGEventType::KeyUp],
                 move |_proxy, event_type, event| {
                     handle(event_type, event, &state, &sender, diagnostics)
                 },
@@ -116,6 +118,9 @@ fn handle(
 ) -> CallbackResult {
     match event_type {
         CGEventType::FlagsChanged => modifiers_changed(event, state, sender, diagnostics),
+        CGEventType::KeyDown | CGEventType::KeyUp if is_wispr_dismiss_event(event) => {
+            CallbackResult::Drop
+        }
         CGEventType::KeyDown => key_down(event, state, sender, diagnostics),
         CGEventType::TapDisabledByTimeout | CGEventType::TapDisabledByUserInput => {
             CFRunLoop::get_current().stop();
@@ -123,6 +128,24 @@ fn handle(
         }
         _ => CallbackResult::Keep,
     }
+}
+
+pub fn dismiss_wispr_notification() {
+    let Ok(source) = CGEventSource::new(CGEventSourceStateID::HIDSystemState) else {
+        return;
+    };
+    for pressed in [true, false] {
+        let Ok(event) = CGEvent::new_keyboard_event(source.clone(), KeyCode::ESCAPE, pressed)
+        else {
+            return;
+        };
+        event.set_integer_value_field(EventField::EVENT_SOURCE_USER_DATA, WISPR_DISMISS_MARKER);
+        event.post(CGEventTapLocation::HID);
+    }
+}
+
+fn is_wispr_dismiss_event(event: &CGEvent) -> bool {
+    event.get_integer_value_field(EventField::EVENT_SOURCE_USER_DATA) == WISPR_DISMISS_MARKER
 }
 
 fn modifiers_changed(
@@ -204,8 +227,12 @@ fn key_down(
 
 #[cfg(test)]
 mod tests {
-    use super::{KeyCode, State};
+    use super::{KeyCode, State, WISPR_DISMISS_MARKER, is_wispr_dismiss_event};
     use core_graphics::event::CGEventFlags;
+    use core_graphics::{
+        event::{CGEvent, EventField},
+        event_source::{CGEventSource, CGEventSourceStateID},
+    };
 
     #[test]
     fn state_starts_idle() {
@@ -272,5 +299,15 @@ mod tests {
             None
         );
         assert!(!state.function_down);
+    }
+
+    #[test]
+    fn recognizes_only_its_own_dismiss_event() {
+        let source = CGEventSource::new(CGEventSourceStateID::Private).unwrap();
+        let event = CGEvent::new_keyboard_event(source, KeyCode::ESCAPE, true).unwrap();
+        assert!(!is_wispr_dismiss_event(&event));
+
+        event.set_integer_value_field(EventField::EVENT_SOURCE_USER_DATA, WISPR_DISMISS_MARKER);
+        assert!(is_wispr_dismiss_event(&event));
     }
 }
