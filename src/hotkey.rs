@@ -4,7 +4,6 @@ use core_graphics::event::{
     CGEvent, CGEventFlags, CGEventTap, CGEventTapLocation, CGEventTapOptions, CGEventTapPlacement,
     CGEventType, CallbackResult, EventField, KeyCode,
 };
-use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
 use std::{
     env, io,
     sync::{Arc, Mutex, mpsc::Sender},
@@ -12,7 +11,6 @@ use std::{
 };
 
 const PASTE_TIMEOUT: Duration = Duration::from_secs(15);
-const WISPR_DISMISS_MARKER: i64 = 0x4658_5749_5350_5201;
 
 #[link(name = "CoreGraphics", kind = "framework")]
 unsafe extern "C" {
@@ -26,6 +24,7 @@ struct State {
     function_down: bool,
     combo_down: bool,
     waiting_since: Option<Instant>,
+    consuming_paste_key_up: bool,
 }
 
 impl State {
@@ -118,34 +117,14 @@ fn handle(
 ) -> CallbackResult {
     match event_type {
         CGEventType::FlagsChanged => modifiers_changed(event, state, sender, diagnostics),
-        CGEventType::KeyDown | CGEventType::KeyUp if is_wispr_dismiss_event(event) => {
-            CallbackResult::Drop
-        }
         CGEventType::KeyDown => key_down(event, state, sender, diagnostics),
+        CGEventType::KeyUp => key_up(event, state),
         CGEventType::TapDisabledByTimeout | CGEventType::TapDisabledByUserInput => {
             CFRunLoop::get_current().stop();
             CallbackResult::Keep
         }
         _ => CallbackResult::Keep,
     }
-}
-
-pub fn dismiss_wispr_notification() {
-    let Ok(source) = CGEventSource::new(CGEventSourceStateID::HIDSystemState) else {
-        return;
-    };
-    for pressed in [true, false] {
-        let Ok(event) = CGEvent::new_keyboard_event(source.clone(), KeyCode::ESCAPE, pressed)
-        else {
-            return;
-        };
-        event.set_integer_value_field(EventField::EVENT_SOURCE_USER_DATA, WISPR_DISMISS_MARKER);
-        event.post(CGEventTapLocation::HID);
-    }
-}
-
-fn is_wispr_dismiss_event(event: &CGEvent) -> bool {
-    event.get_integer_value_field(EventField::EVENT_SOURCE_USER_DATA) == WISPR_DISMISS_MARKER
 }
 
 fn modifiers_changed(
@@ -171,6 +150,7 @@ fn modifiers_changed(
     match state.modifier_changed(key, event.get_flags()) {
         Some(true) => {
             state.waiting_since = None;
+            state.consuming_paste_key_up = false;
             let _ = sender.send(Event::Pressed(SystemTime::now()));
         }
         Some(false) => {
@@ -203,6 +183,7 @@ fn key_down(
     if key == KeyCode::ESCAPE && (state.combo_down || state.waiting_since.is_some()) {
         state.combo_down = false;
         state.waiting_since = None;
+        state.consuming_paste_key_up = false;
         let _ = sender.send(Event::Cancelled);
         return CallbackResult::Keep;
     }
@@ -212,6 +193,7 @@ fn key_down(
     };
     if started.elapsed() > PASTE_TIMEOUT {
         state.waiting_since = None;
+        state.consuming_paste_key_up = false;
         let _ = sender.send(Event::Cancelled);
         return CallbackResult::Keep;
     }
@@ -220,25 +202,41 @@ fn key_down(
     }
 
     state.waiting_since = None;
+    state.consuming_paste_key_up = true;
     drop(state);
     let _ = sender.send(Event::Paste);
-    CallbackResult::Drop
+    neutralize(event)
+}
+
+fn key_up(event: &CGEvent, state: &Mutex<State>) -> CallbackResult {
+    let key = event.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE) as u16;
+    let mut state = state.lock().unwrap_or_else(|error| error.into_inner());
+    if key != KeyCode::ANSI_V || !state.consuming_paste_key_up {
+        return CallbackResult::Keep;
+    }
+    state.consuming_paste_key_up = false;
+    neutralize(event)
+}
+
+fn neutralize(event: &CGEvent) -> CallbackResult {
+    let event = event.clone();
+    event.set_type(CGEventType::Null);
+    event.set_flags(CGEventFlags::empty());
+    CallbackResult::Replace(event)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{KeyCode, State, WISPR_DISMISS_MARKER, is_wispr_dismiss_event};
-    use core_graphics::event::CGEventFlags;
-    use core_graphics::{
-        event::{CGEvent, EventField},
-        event_source::{CGEventSource, CGEventSourceStateID},
-    };
+    use super::{KeyCode, State, neutralize};
+    use core_graphics::event::{CGEvent, CGEventFlags, CGEventType, CallbackResult};
+    use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
 
     #[test]
     fn state_starts_idle() {
         let state = State::default();
         assert!(!state.combo_down);
         assert!(state.waiting_since.is_none());
+        assert!(!state.consuming_paste_key_up);
     }
 
     #[test]
@@ -302,12 +300,14 @@ mod tests {
     }
 
     #[test]
-    fn recognizes_only_its_own_dismiss_event() {
+    fn neutralized_paste_continues_without_a_key_event() {
         let source = CGEventSource::new(CGEventSourceStateID::Private).unwrap();
-        let event = CGEvent::new_keyboard_event(source, KeyCode::ESCAPE, true).unwrap();
-        assert!(!is_wispr_dismiss_event(&event));
-
-        event.set_integer_value_field(EventField::EVENT_SOURCE_USER_DATA, WISPR_DISMISS_MARKER);
-        assert!(is_wispr_dismiss_event(&event));
+        let event = CGEvent::new_keyboard_event(source, KeyCode::ANSI_V, true).unwrap();
+        event.set_flags(CGEventFlags::CGEventFlagCommand);
+        let CallbackResult::Replace(event) = neutralize(&event) else {
+            panic!("paste was not replaced");
+        };
+        assert_eq!(event.get_type() as u32, CGEventType::Null as u32);
+        assert!(event.get_flags().is_empty());
     }
 }
