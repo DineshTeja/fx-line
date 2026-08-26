@@ -1,19 +1,26 @@
+#[cfg(target_os = "macos")]
+use crate::indicator::{Handle as Indicator, Phase};
 use crate::{
-    cmux::{Action, Cmux, Context, Status},
+    cmux::{Action, Cmux, Context},
     context, fx, output,
 };
 use serde::{Deserialize, Serialize};
 use std::{
+    env,
     error::Error,
+    fmt::Display,
+    fs::OpenOptions,
     io,
+    io::Write,
     path::Path,
     sync::mpsc::{self, Receiver, RecvTimeoutError},
     thread,
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 const PLAN_ATTEMPTS: usize = 2;
 const TRANSCRIPT_TIMEOUT: Duration = Duration::from_secs(15);
+const PERMISSION_RETRY: Duration = Duration::from_secs(1);
 const PLAN_RULES: &str = r#"Return only JSON: {"actions":[],"fallback":false,"message":"short result"}.
 Every request needs actions or fallback=true. Never use tools.
 Actions: open_browser(url,[direction]); new_terminal(direction); focus_pane(pane); swap_panes(pane,target); resize_pane(pane,direction,amount); move_surface(surface,pane); split_surface(surface,direction); new_workspace([name],[cwd]); select_workspace(workspace); rename_workspace(name,[workspace]); rename_tab(name,[surface]); open(target); sidebar(action); flash; close_surface([surface]); close_workspace([workspace]).
@@ -26,9 +33,11 @@ type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 
 #[derive(Debug)]
 pub enum Event {
-    Pressed,
+    Ready,
+    Unavailable,
+    Pressed(SystemTime),
     Released,
-    Transcript(String),
+    Paste,
     Cancelled,
 }
 
@@ -43,30 +52,59 @@ pub struct Plan {
 }
 
 pub fn run_daemon() -> Result<()> {
-    let (sender, receiver) = mpsc::channel();
-    let worker = thread::Builder::new()
-        .name("fx-agent-worker".into())
-        .stack_size(256 * 1024)
-        .spawn(move || worker(receiver))?;
-
     #[cfg(target_os = "macos")]
     {
-        let result = crate::hotkey::listen(sender);
-        if result.is_err() {
-            let _ = worker.join();
-            let cmux = Cmux::new();
-            if let Ok(context) = cmux.context() {
-                let _ = cmux.status(&context, Status::Off);
-            }
-        }
-        result
+        let indicator = Indicator::default();
+        let (sender, receiver) = mpsc::channel();
+        thread::Builder::new()
+            .name("fx-agent-worker".into())
+            .stack_size(256 * 1024)
+            .spawn({
+                let indicator = indicator.clone();
+                move || worker(receiver, indicator)
+            })?;
+        thread::Builder::new()
+            .name("fx-agent-hotkey".into())
+            .stack_size(256 * 1024)
+            .spawn(move || listen(sender))?;
+        crate::indicator::run(indicator)?;
+        Ok(())
     }
 
     #[cfg(not(target_os = "macos"))]
     {
-        drop(sender);
-        let _ = worker.join();
         Err(io::Error::other("fx-agent requires macOS").into())
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn listen(sender: mpsc::Sender<Event>) {
+    let mut reported = false;
+    loop {
+        match crate::hotkey::listen(sender.clone()) {
+            Ok(()) => {
+                reported = false;
+                thread::sleep(Duration::from_millis(100));
+            }
+            Err(error)
+                if error
+                    .downcast_ref::<io::Error>()
+                    .is_some_and(|error| error.kind() == io::ErrorKind::PermissionDenied) =>
+            {
+                if !reported {
+                    report(error);
+                    crate::hotkey::request_access();
+                    reported = true;
+                }
+                let _ = sender.send(Event::Unavailable);
+                thread::sleep(PERMISSION_RETRY);
+            }
+            Err(error) => {
+                report(error);
+                let _ = sender.send(Event::Unavailable);
+                thread::sleep(PERMISSION_RETRY);
+            }
+        }
     }
 }
 
@@ -82,13 +120,13 @@ pub fn run_request(request: &str) -> Result<String> {
     run_with_context(&cmux, &context, request)
 }
 
-fn worker(receiver: Receiver<Event>) {
+#[cfg(target_os = "macos")]
+fn worker(receiver: Receiver<Event>, indicator: Indicator) {
     let cmux = Cmux::new();
-    if let Ok(context) = cmux.context() {
-        let _ = cmux.status(&context, Status::Ready);
-    }
     let mut context = None;
+    let mut capture = None;
     let mut awaiting_transcript = false;
+    let _ = cmux.clear_agent_statuses();
 
     loop {
         let event = if awaiting_transcript {
@@ -96,9 +134,9 @@ fn worker(receiver: Receiver<Event>) {
                 Ok(event) => Some(event),
                 Err(RecvTimeoutError::Timeout) => {
                     awaiting_transcript = false;
-                    if let Some(context) = context.take() {
-                        let _ = cmux.status(&context, Status::Ready);
-                    }
+                    context = None;
+                    capture = None;
+                    indicator.set(Phase::Ready);
                     None
                 }
                 Err(RecvTimeoutError::Disconnected) => break,
@@ -111,48 +149,91 @@ fn worker(receiver: Receiver<Event>) {
         };
 
         match event {
-            Some(Event::Pressed) => {
+            Some(Event::Ready) => {
+                indicator.set(Phase::Ready);
+            }
+            Some(Event::Unavailable) => {
+                indicator.set(Phase::Off);
+            }
+            Some(Event::Pressed(pressed_at)) => {
                 awaiting_transcript = false;
-                context = cmux.context().ok();
-                if let Some(context) = &context {
-                    let _ = cmux.status(context, Status::Listening);
-                }
+                capture = Some(crate::wispr::capture(pressed_at));
+                context = match cmux.context() {
+                    Ok(context) => Some(context),
+                    Err(error) => {
+                        report(format_args!("CMUX context capture failed: {error}"));
+                        None
+                    }
+                };
+                indicator.set(Phase::Listening);
             }
             Some(Event::Released) => {
                 awaiting_transcript = true;
-                if let Some(context) = &context {
-                    let _ = cmux.status(context, Status::Transcribing);
-                }
+                indicator.set(Phase::Transcribing);
             }
-            Some(Event::Transcript(request)) => {
+            Some(Event::Paste) => {
                 awaiting_transcript = false;
-                let Some(context) = context.take() else {
-                    continue;
+                let context = context.take().or_else(|| match cmux.context() {
+                    Ok(context) => Some(context),
+                    Err(error) => {
+                        report(format_args!("CMUX context retry failed: {error}"));
+                        None
+                    }
+                });
+                let result = match (context.as_ref(), capture.take()) {
+                    (Some(context), Some(capture)) => {
+                        crate::wispr::transcript(capture).and_then(|request| {
+                            indicator.set(Phase::Working);
+                            run_with_context(&cmux, context, request.trim()).map(|_| ())
+                        })
+                    }
+                    _ => {
+                        Err(io::Error::other("could not capture the focused CMUX workspace").into())
+                    }
                 };
-                if let Err(error) = run_with_context(&cmux, &context, request.trim()) {
-                    let _ = cmux.status(&context, Status::Error);
-                    let _ = cmux.notify(&context, &summary(&error.to_string()));
-                    thread::sleep(Duration::from_millis(700));
-                    let _ = cmux.status(&context, Status::Ready);
+                if let Err(error) = result {
+                    report(format_args!("request failed: {error}"));
+                    indicator.set(Phase::Error);
+                    if let Some(context) = &context {
+                        let _ = cmux.notify(context, &summary(&error.to_string()));
+                    }
+                } else {
+                    indicator.set(Phase::Done);
                 }
+                thread::sleep(Duration::from_millis(700));
+                indicator.set(Phase::Ready);
             }
             Some(Event::Cancelled) => {
                 awaiting_transcript = false;
-                if let Some(context) = context.take() {
-                    let _ = cmux.status(&context, Status::Ready);
-                }
+                context = None;
+                capture = None;
+                indicator.set(Phase::Ready);
             }
             None => {}
         }
     }
 }
 
+fn report(error: impl Display) {
+    eprintln!("fx-agent: {error}");
+    let Some(home) = env::var_os("HOME") else {
+        return;
+    };
+    let path = Path::new(&home).join("Library/Application Support/fx-line/agent.log");
+    let Ok(mut log) = OpenOptions::new().create(true).append(true).open(path) else {
+        return;
+    };
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64();
+    let _ = writeln!(log, "{timestamp:.3} fx-agent: {error}");
+}
+
 fn run_with_context(cmux: &Cmux, context: &Context, request: &str) -> Result<String> {
     if request.is_empty() {
         return Err(io::Error::other("Wispr returned an empty transcript").into());
     }
-    cmux.status(context, Status::Working)?;
-
     let plan = create_plan(request, context)?;
     for action in &plan.actions {
         cmux.execute(context, request, action)?;
@@ -180,10 +261,7 @@ fn run_with_context(cmux: &Cmux, context: &Context, request: &str) -> Result<Str
         return Ok(result);
     }
 
-    cmux.status(context, Status::Done)?;
     cmux.notify(context, &result)?;
-    thread::sleep(Duration::from_millis(700));
-    cmux.status(context, Status::Ready)?;
     Ok(result)
 }
 

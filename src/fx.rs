@@ -1,6 +1,7 @@
 use std::{
     env,
     error::Error,
+    ffi::OsString,
     fs,
     io::{self, Read, Write},
     path::{Path, PathBuf},
@@ -11,7 +12,7 @@ use std::{
 
 const DEFAULT_AGENT_MODEL: &str = "zai/glm-5.2-fast";
 const DEFAULT_LINE_MODEL: &str = "zai/glm-4.7-flash";
-const DEFAULT_PLAN_MODEL: &str = "thinkingmachines/inkling-small";
+const DEFAULT_PLAN_MODEL: &str = "zai/glm-4.7-flash";
 const MAX_ATTEMPTS: usize = 2;
 const LINE_TIMEOUT: Duration = Duration::from_secs(5);
 const AGENT_TIMEOUT: Duration = Duration::from_secs(120);
@@ -76,7 +77,7 @@ fn request(
 ) -> Result<String> {
     let workspace = cwd.is_none().then(Workspace::new).transpose()?;
     let cwd = cwd.unwrap_or_else(|| workspace.as_ref().expect("temporary workspace").path());
-    let binary = env::var_os("FX_LINE_FX").unwrap_or_else(|| "fx".into());
+    let binary = binary();
 
     let mut child = Command::new(binary)
         .args([
@@ -87,6 +88,7 @@ fn request(
             "--no-color",
         ])
         .current_dir(cwd)
+        .env("PATH", runtime_path())
         .env("FX_MODEL", model)
         .env("FX_PERMISSION_MODE", permission)
         .env("FX_MAX_AGENT_STEPS", max_steps.to_string())
@@ -136,6 +138,47 @@ fn request(
     }
 
     Ok(crate::output::envelope(&stdout)?)
+}
+
+fn runtime_path() -> OsString {
+    let mut paths = Vec::new();
+    if let Some(home) = env::var_os("HOME") {
+        let home = PathBuf::from(home);
+        paths.push(home.join(".local/bin"));
+        paths.push(home.join(".cargo/bin"));
+    }
+    paths.extend([
+        PathBuf::from("/opt/homebrew/bin"),
+        PathBuf::from("/usr/local/bin"),
+    ]);
+    if let Some(inherited) = env::var_os("PATH") {
+        paths.extend(env::split_paths(&inherited));
+    }
+
+    env::join_paths(paths).unwrap_or_else(|_| env::var_os("PATH").unwrap_or_default())
+}
+
+fn binary() -> OsString {
+    if let Some(binary) = env::var_os("FX_LINE_FX") {
+        return binary;
+    }
+
+    let mut candidates = Vec::new();
+    if let Some(home) = env::var_os("HOME") {
+        let home = PathBuf::from(home);
+        candidates.push(home.join(".local/bin/fx"));
+        candidates.push(home.join(".cargo/bin/fx"));
+    }
+    candidates.extend([
+        PathBuf::from("/opt/homebrew/bin/fx"),
+        PathBuf::from("/usr/local/bin/fx"),
+    ]);
+
+    candidates
+        .into_iter()
+        .find(|path| path.is_file())
+        .map(PathBuf::into_os_string)
+        .unwrap_or_else(|| "fx".into())
 }
 
 fn line_prompt(request: &str, cwd: &str, current_line: &str) -> String {

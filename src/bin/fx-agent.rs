@@ -1,4 +1,4 @@
-use std::{env, io, process::ExitCode};
+use std::{env, process::ExitCode};
 
 fn main() -> ExitCode {
     match run() {
@@ -21,16 +21,7 @@ fn run() -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
 
     match command.as_str() {
         "run" if args.next().is_none() => {
-            if let Err(error) = fx_line::agent::run_daemon() {
-                if error
-                    .downcast_ref::<io::Error>()
-                    .is_some_and(|error| error.kind() == io::ErrorKind::PermissionDenied)
-                {
-                    eprintln!("fx-agent: {error}");
-                    return Ok(None);
-                }
-                return Err(error);
-            }
+            fx_line::agent::run_daemon()?;
             Ok(None)
         }
         "plan" => {

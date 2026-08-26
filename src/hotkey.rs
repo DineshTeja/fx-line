@@ -5,38 +5,104 @@ use core_graphics::event::{
     CGEventType, CallbackResult, EventField, KeyCode,
 };
 use std::{
-    io,
-    process::Command,
+    env, io,
     sync::{Arc, Mutex, mpsc::Sender},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 const PASTE_TIMEOUT: Duration = Duration::from_secs(15);
-const MAX_TRANSCRIPT_BYTES: usize = 32 * 1024;
+
+#[link(name = "CoreGraphics", kind = "framework")]
+unsafe extern "C" {
+    fn CGRequestListenEventAccess() -> bool;
+    fn CGRequestPostEventAccess() -> bool;
+}
 
 #[derive(Default)]
 struct State {
+    control_down: bool,
+    function_down: bool,
     combo_down: bool,
     waiting_since: Option<Instant>,
 }
 
+impl State {
+    fn modifier_changed(&mut self, key: u16, flags: CGEventFlags) -> Option<bool> {
+        if key == KeyCode::CONTROL || key == KeyCode::RIGHT_CONTROL {
+            self.control_down = flags.contains(CGEventFlags::CGEventFlagControl);
+        } else if key == KeyCode::FUNCTION {
+            self.function_down = if flags.contains(CGEventFlags::CGEventFlagSecondaryFn) {
+                true
+            } else {
+                !self.function_down
+            };
+        }
+
+        let pressed = self.control_down && self.function_down;
+        if pressed == self.combo_down {
+            return None;
+        }
+        self.combo_down = pressed;
+        Some(pressed)
+    }
+}
+
+pub fn request_access() {
+    unsafe {
+        CGRequestPostEventAccess();
+        CGRequestListenEventAccess();
+    }
+}
+
 pub fn listen(sender: Sender<Event>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let state = Arc::new(Mutex::new(State::default()));
+    let diagnostics = env::var_os("FX_AGENT_DIAGNOSTICS").is_some();
+    let modifier_state = Arc::clone(&state);
+    let modifier_sender = sender.clone();
+    let ready_sender = sender.clone();
 
-    CGEventTap::with_enabled(
-        CGEventTapLocation::Session,
+    let taps = CGEventTap::with_enabled(
+        CGEventTapLocation::HID,
         CGEventTapPlacement::HeadInsertEventTap,
         CGEventTapOptions::Default,
-        vec![CGEventType::FlagsChanged, CGEventType::KeyDown],
-        move |_proxy, event_type, event| handle(event_type, event, &state, &sender),
-        CFRunLoop::run_current,
-    )
-    .map_err(|()| {
-        io::Error::new(
+        vec![CGEventType::FlagsChanged],
+        move |_proxy, event_type, event| {
+            handle(
+                event_type,
+                event,
+                &modifier_state,
+                &modifier_sender,
+                diagnostics,
+            )
+        },
+        move || {
+            CGEventTap::with_enabled(
+                CGEventTapLocation::Session,
+                CGEventTapPlacement::HeadInsertEventTap,
+                CGEventTapOptions::Default,
+                vec![CGEventType::KeyDown],
+                move |_proxy, event_type, event| {
+                    handle(event_type, event, &state, &sender, diagnostics)
+                },
+                move || {
+                    let _ = ready_sender.send(Event::Ready);
+                    CFRunLoop::run_current();
+                },
+            )
+        },
+    );
+
+    match taps {
+        Err(()) => Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
-            "fx-agent needs macOS Accessibility permission",
-        )
-    })?;
+            "could not create the modifier event tap",
+        ))?,
+        Ok(Err(())) => Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "could not create the paste event tap",
+        ))?,
+        Ok(Ok(())) => {}
+    }
 
     Ok(())
 }
@@ -46,13 +112,14 @@ fn handle(
     event: &CGEvent,
     state: &Mutex<State>,
     sender: &Sender<Event>,
+    diagnostics: bool,
 ) -> CallbackResult {
     match event_type {
-        CGEventType::FlagsChanged => modifiers_changed(event, state, sender),
-        CGEventType::KeyDown => key_down(event, state, sender),
+        CGEventType::FlagsChanged => modifiers_changed(event, state, sender, diagnostics),
+        CGEventType::KeyDown => key_down(event, state, sender, diagnostics),
         CGEventType::TapDisabledByTimeout | CGEventType::TapDisabledByUserInput => {
-            // launchd immediately replaces us with a fresh event tap.
-            std::process::exit(70)
+            CFRunLoop::get_current().stop();
+            CallbackResult::Keep
         }
         _ => CallbackResult::Keep,
     }
@@ -62,29 +129,53 @@ fn modifiers_changed(
     event: &CGEvent,
     state: &Mutex<State>,
     sender: &Sender<Event>,
+    diagnostics: bool,
 ) -> CallbackResult {
-    let flags = event.get_flags();
-    let pressed = flags.contains(CGEventFlags::CGEventFlagControl)
-        && flags.contains(CGEventFlags::CGEventFlagSecondaryFn);
+    let key = event.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE) as u16;
+    if diagnostics
+        && matches!(
+            key,
+            KeyCode::CONTROL | KeyCode::RIGHT_CONTROL | KeyCode::FUNCTION
+        )
+    {
+        eprintln!(
+            "fx-agent: modifier key={key} flags={:#x}",
+            event.get_flags()
+        );
+    }
     let mut state = state.lock().unwrap_or_else(|error| error.into_inner());
 
-    if pressed && !state.combo_down {
-        state.combo_down = true;
-        state.waiting_since = None;
-        let _ = sender.send(Event::Pressed);
-    } else if !pressed && state.combo_down {
-        state.combo_down = false;
-        state.waiting_since = Some(Instant::now());
-        let _ = sender.send(Event::Released);
+    match state.modifier_changed(key, event.get_flags()) {
+        Some(true) => {
+            state.waiting_since = None;
+            let _ = sender.send(Event::Pressed(SystemTime::now()));
+        }
+        Some(false) => {
+            state.waiting_since = Some(Instant::now());
+            let _ = sender.send(Event::Released);
+        }
+        None => {}
     }
 
     CallbackResult::Keep
 }
 
-fn key_down(event: &CGEvent, state: &Mutex<State>, sender: &Sender<Event>) -> CallbackResult {
+fn key_down(
+    event: &CGEvent,
+    state: &Mutex<State>,
+    sender: &Sender<Event>,
+    diagnostics: bool,
+) -> CallbackResult {
     let key = event.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE) as u16;
     let flags = event.get_flags();
     let mut state = state.lock().unwrap_or_else(|error| error.into_inner());
+
+    if diagnostics && key == KeyCode::ANSI_V && flags.contains(CGEventFlags::CGEventFlagCommand) {
+        eprintln!(
+            "fx-agent: paste event waiting={}",
+            state.waiting_since.is_some()
+        );
+    }
 
     if key == KeyCode::ESCAPE && (state.combo_down || state.waiting_since.is_some()) {
         state.combo_down = false;
@@ -107,36 +198,79 @@ fn key_down(event: &CGEvent, state: &Mutex<State>, sender: &Sender<Event>) -> Ca
 
     state.waiting_since = None;
     drop(state);
-    match transcript() {
-        Ok(text) if !text.trim().is_empty() => {
-            let _ = sender.send(Event::Transcript(text));
-        }
-        _ => {
-            let _ = sender.send(Event::Cancelled);
-        }
-    }
+    let _ = sender.send(Event::Paste);
     CallbackResult::Drop
-}
-
-fn transcript() -> io::Result<String> {
-    let output = Command::new("/usr/bin/pbpaste").output()?;
-    if !output.status.success() {
-        return Err(io::Error::other("could not read Wispr transcript"));
-    }
-    if output.stdout.len() > MAX_TRANSCRIPT_BYTES {
-        return Err(io::Error::other("Wispr transcript is too large"));
-    }
-    String::from_utf8(output.stdout).map_err(io::Error::other)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::State;
+    use super::{KeyCode, State};
+    use core_graphics::event::CGEventFlags;
 
     #[test]
     fn state_starts_idle() {
         let state = State::default();
         assert!(!state.combo_down);
         assert!(state.waiting_since.is_none());
+    }
+
+    #[test]
+    fn tracks_function_then_control() {
+        let mut state = State::default();
+
+        assert_eq!(
+            state.modifier_changed(KeyCode::FUNCTION, CGEventFlags::CGEventFlagSecondaryFn,),
+            None
+        );
+        assert_eq!(
+            state.modifier_changed(KeyCode::CONTROL, CGEventFlags::CGEventFlagControl),
+            Some(true)
+        );
+        assert_eq!(
+            state.modifier_changed(KeyCode::CONTROL, CGEventFlags::empty()),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn tracks_control_then_function() {
+        let mut state = State::default();
+
+        assert_eq!(
+            state.modifier_changed(KeyCode::CONTROL, CGEventFlags::CGEventFlagControl),
+            None
+        );
+        assert_eq!(
+            state.modifier_changed(KeyCode::FUNCTION, CGEventFlags::CGEventFlagSecondaryFn,),
+            Some(true)
+        );
+        assert_eq!(
+            state.modifier_changed(KeyCode::FUNCTION, CGEventFlags::CGEventFlagControl),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn tracks_function_when_its_flag_is_missing() {
+        let mut state = State::default();
+
+        assert_eq!(
+            state.modifier_changed(KeyCode::FUNCTION, CGEventFlags::empty()),
+            None
+        );
+        assert!(state.function_down);
+        assert_eq!(
+            state.modifier_changed(KeyCode::CONTROL, CGEventFlags::CGEventFlagControl),
+            Some(true)
+        );
+        assert_eq!(
+            state.modifier_changed(KeyCode::CONTROL, CGEventFlags::empty()),
+            Some(false)
+        );
+        assert_eq!(
+            state.modifier_changed(KeyCode::FUNCTION, CGEventFlags::empty()),
+            None
+        );
+        assert!(!state.function_down);
     }
 }

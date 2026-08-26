@@ -1,30 +1,50 @@
 use std::{
     env, fs, io,
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Output},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 const LABEL: &str = "com.dineshteja.fx-agent";
+const APP_NAME: &str = "fx-agent.app";
+const DESIGNATED_REQUIREMENT: &str = "=designated => identifier \"com.dineshteja.fx-agent\"";
+const START_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub fn install(binary: &Path) -> io::Result<()> {
     let home = home()?;
     let agents = home.join("Library/LaunchAgents");
     let state = home.join("Library/Application Support/fx-line");
+    let app = home.join("Applications").join(APP_NAME);
+    let app_binary = app.join("Contents/MacOS/fx-agent");
+    let plist = agents.join(format!("{LABEL}.plist"));
+    let service = format!("{}/{}", domain()?, LABEL);
+
     fs::create_dir_all(&agents)?;
     fs::create_dir_all(&state)?;
-
-    let plist = agents.join(format!("{LABEL}.plist"));
-    let contents = plist_contents(binary, &home, &state);
-    let pending = plist.with_extension("plist.new");
-    fs::write(&pending, contents)?;
-    fs::rename(pending, &plist)?;
-
-    let service = format!("{}/{}", domain()?, LABEL);
+    fs::create_dir_all(app_binary.parent().expect("app binary has a parent"))?;
     let _ = Command::new("/bin/launchctl")
         .args(["bootout", &service])
         .output();
+    stop(&app_binary)?;
+
+    replace(binary, &app_binary)?;
+    replace_text(&app.join("Contents/Info.plist"), &info_contents(&home))?;
+    checked(
+        Command::new("/usr/bin/codesign")
+            .args([
+                "--force",
+                "--sign",
+                "-",
+                "--timestamp=none",
+                "--requirements",
+                DESIGNATED_REQUIREMENT,
+            ])
+            .arg(&app)
+            .output()?,
+    )?;
+    replace_text(&plist, &plist_contents(&app, &state))?;
+
     checked(
         Command::new("/bin/launchctl")
             .args(["bootstrap", service_domain(&service), path(&plist)?])
@@ -35,24 +55,29 @@ pub fn install(binary: &Path) -> io::Result<()> {
             .args(["kickstart", "-k", &service])
             .output()?,
     )?;
-    thread::sleep(Duration::from_millis(1_500));
-    if is_running()? {
-        Ok(())
-    } else {
-        Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "grant Accessibility to ~/.local/bin/fx-agent, then run `fx-agent install` again",
-        ))
+
+    let started = Instant::now();
+    while started.elapsed() < START_TIMEOUT {
+        if process_id(&app_binary)?.is_some() {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(100));
     }
+    Err(io::Error::other("fx-agent did not start"))
 }
 
 pub fn uninstall() -> io::Result<()> {
-    let plist = home()?.join(format!("Library/LaunchAgents/{LABEL}.plist"));
+    let home = home()?;
+    let app = home.join("Applications").join(APP_NAME);
+    let app_binary = app.join("Contents/MacOS/fx-agent");
+    let plist = home.join(format!("Library/LaunchAgents/{LABEL}.plist"));
     let service = format!("{}/{}", domain()?, LABEL);
     let _ = Command::new("/bin/launchctl")
         .args(["bootout", &service])
         .output();
-    match fs::remove_file(plist) {
+    stop(&app_binary)?;
+    remove_file(plist)?;
+    match fs::remove_dir_all(app) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error),
@@ -60,24 +85,106 @@ pub fn uninstall() -> io::Result<()> {
 }
 
 pub fn is_running() -> io::Result<bool> {
-    let service = format!("{}/{}", domain()?, LABEL);
-    let output = Command::new("/bin/launchctl")
-        .args(["print", &service])
-        .output()?;
-    Ok(output.status.success()
-        && String::from_utf8_lossy(&output.stdout).contains("\n\tstate = running"))
+    let binary = home()?.join(format!("Applications/{APP_NAME}/Contents/MacOS/fx-agent"));
+    Ok(process_id(&binary)?.is_some())
 }
 
-fn plist_contents(binary: &Path, home: &Path, state: &Path) -> String {
-    let binary = escape(&binary.to_string_lossy());
+fn stop(binary: &Path) -> io::Result<()> {
+    let Some(pid) = process_id(binary)? else {
+        return Ok(());
+    };
+    let _ = Command::new("/bin/kill").arg(pid.to_string()).output();
+    for _ in 0..20 {
+        if process_id(binary)?.is_none() {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    Err(io::Error::other("the previous fx-agent did not stop"))
+}
+
+fn process_id(binary: &Path) -> io::Result<Option<u32>> {
+    let binary = binary.to_string_lossy();
+    let output = checked(
+        Command::new("/bin/ps")
+            .args(["-axo", "pid=,command="])
+            .output()?,
+    )?;
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let line = line.trim();
+        let Some((pid, command)) = line.split_once(char::is_whitespace) else {
+            continue;
+        };
+        if command.trim() == binary {
+            return pid.parse().map(Some).map_err(io::Error::other);
+        }
+    }
+    Ok(None)
+}
+
+fn replace(source: &Path, destination: &Path) -> io::Result<()> {
+    let pending = destination.with_extension("new");
+    fs::copy(source, &pending)?;
+    fs::set_permissions(&pending, fs::metadata(source)?.permissions())?;
+    fs::rename(pending, destination)
+}
+
+fn replace_text(destination: &Path, contents: &str) -> io::Result<()> {
+    let pending = destination.with_extension("new");
+    fs::write(&pending, contents)?;
+    fs::rename(pending, destination)
+}
+
+fn remove_file(path: PathBuf) -> io::Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn info_contents(home: &Path) -> String {
     let path = escape(&format!(
         "{}/.local/bin:{}/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
         home.display(),
         home.display()
     ));
     let home = escape(&home.to_string_lossy());
-    let log = escape(&state.join("agent.log").to_string_lossy());
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleExecutable</key>
+  <string>fx-agent</string>
+  <key>CFBundleIdentifier</key>
+  <string>{LABEL}</string>
+  <key>CFBundleInfoDictionaryVersion</key>
+  <string>6.0</string>
+  <key>CFBundleName</key>
+  <string>fx-agent</string>
+  <key>CFBundlePackageType</key>
+  <string>APPL</string>
+  <key>CFBundleShortVersionString</key>
+  <string>0.1.0</string>
+  <key>LSUIElement</key>
+  <true/>
+  <key>LSEnvironment</key>
+  <dict>
+    <key>HOME</key>
+    <string>{home}</string>
+    <key>PATH</key>
+    <string>{path}</string>
+  </dict>
+</dict>
+</plist>
+"#
+    )
+}
 
+fn plist_contents(app: &Path, state: &Path) -> String {
+    let app = escape(&app.to_string_lossy());
+    let log = escape(&state.join("agent.log").to_string_lossy());
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -87,27 +194,13 @@ fn plist_contents(binary: &Path, home: &Path, state: &Path) -> String {
   <string>{LABEL}</string>
   <key>ProgramArguments</key>
   <array>
-    <string>{binary}</string>
-    <string>run</string>
+    <string>/usr/bin/open</string>
+    <string>-g</string>
+    <string>-j</string>
+    <string>{app}</string>
   </array>
-  <key>EnvironmentVariables</key>
-  <dict>
-    <key>HOME</key>
-    <string>{home}</string>
-    <key>PATH</key>
-    <string>{path}</string>
-  </dict>
   <key>RunAtLoad</key>
   <true/>
-  <key>KeepAlive</key>
-  <dict>
-    <key>SuccessfulExit</key>
-    <false/>
-  </dict>
-  <key>ThrottleInterval</key>
-  <integer>5</integer>
-  <key>ProcessType</key>
-  <string>Background</string>
   <key>LimitLoadToSessionType</key>
   <string>Aqua</string>
   <key>StandardOutPath</key>
@@ -145,14 +238,14 @@ fn path(path: &Path) -> io::Result<&str> {
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path is not valid UTF-8"))
 }
 
-fn checked(output: std::process::Output) -> io::Result<std::process::Output> {
+fn checked(output: Output) -> io::Result<Output> {
     if output.status.success() {
         return Ok(output);
     }
     let message = String::from_utf8_lossy(&output.stderr)
         .lines()
         .find(|line| !line.trim().is_empty())
-        .unwrap_or("launchctl failed")
+        .unwrap_or("command failed")
         .to_owned();
     Err(io::Error::other(message))
 }
@@ -168,7 +261,7 @@ fn escape(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{escape, plist_contents};
+    use super::{escape, info_contents, plist_contents};
     use std::path::Path;
 
     #[test]
@@ -177,15 +270,21 @@ mod tests {
     }
 
     #[test]
-    fn plist_has_one_small_background_process() {
+    fn installs_an_invisible_app() {
+        let info = info_contents(Path::new("/Users/test"));
+        assert!(info.contains("<key>LSUIElement</key>"));
+        assert!(info.contains("com.dineshteja.fx-agent"));
+    }
+
+    #[test]
+    fn launch_agent_starts_the_app_once() {
         let plist = plist_contents(
-            Path::new("/tmp/fx & agent"),
-            Path::new("/Users/test"),
+            Path::new("/Users/test/Applications/fx-agent.app"),
             Path::new("/tmp/state"),
         );
-        assert!(plist.contains("/tmp/fx &amp; agent"));
-        assert!(plist.contains("<string>Background</string>"));
-        assert!(plist.contains("<string>run</string>"));
-        assert!(plist.contains("<key>SuccessfulExit</key>"));
+        assert!(plist.contains("<string>/usr/bin/open</string>"));
+        assert!(plist.contains("<string>/Users/test/Applications/fx-agent.app</string>"));
+        assert!(!plist.contains("<string>-W</string>"));
+        assert!(!plist.contains("<key>KeepAlive</key>"));
     }
 }

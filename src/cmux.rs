@@ -30,31 +30,6 @@ pub struct Context {
     socket: String,
 }
 
-#[derive(Clone, Copy)]
-pub enum Status {
-    Ready,
-    Listening,
-    Transcribing,
-    Working,
-    Done,
-    Error,
-    Off,
-}
-
-impl Status {
-    fn fields(self) -> (&'static str, &'static str, &'static str) {
-        match self {
-            Self::Ready => ("Ready", "waveform", "#7A7A7A"),
-            Self::Listening => ("Listening", "waveform.circle.fill", "#FF453A"),
-            Self::Transcribing => ("Transcribing", "text.bubble", "#FF9F0A"),
-            Self::Working => ("Working", "bolt.fill", "#4C8DFF"),
-            Self::Done => ("Done", "checkmark.circle.fill", "#30D158"),
-            Self::Error => ("Error", "exclamationmark.triangle.fill", "#FF453A"),
-            Self::Off => ("Off", "waveform.slash", "#7A7A7A"),
-        }
-    }
-}
-
 pub struct Cmux {
     binary: OsString,
 }
@@ -104,26 +79,20 @@ impl Cmux {
         })
     }
 
-    pub fn status(&self, context: &Context, status: Status) -> Result<()> {
-        let (label, icon, color) = status.fields();
-        self.context_output(
-            context,
-            [
-                "set-status",
-                STATUS_KEY,
-                label,
-                "--workspace",
-                &context.workspace,
-                "--window",
-                &context.window,
-                "--icon",
-                icon,
-                "--color",
-                color,
-                "--priority",
-                "1000",
-            ],
-        )?;
+    pub fn clear_agent_statuses(&self) -> Result<()> {
+        let tree: Tree = serde_json::from_slice(&self.output(["tree", "--json"])?.stdout)?;
+        for window in tree.windows {
+            for workspace in window.workspaces {
+                self.output([
+                    "clear-status",
+                    STATUS_KEY,
+                    "--workspace",
+                    &workspace.reference,
+                    "--window",
+                    &window.reference,
+                ])?;
+            }
+        }
         Ok(())
     }
 
@@ -247,4 +216,22 @@ struct Focused {
     surface_type: String,
     window_ref: String,
     workspace_ref: String,
+}
+
+#[derive(Deserialize)]
+struct Tree {
+    windows: Vec<TreeWindow>,
+}
+
+#[derive(Deserialize)]
+struct TreeWindow {
+    #[serde(rename = "ref")]
+    reference: String,
+    workspaces: Vec<TreeWorkspace>,
+}
+
+#[derive(Deserialize)]
+struct TreeWorkspace {
+    #[serde(rename = "ref")]
+    reference: String,
 }
