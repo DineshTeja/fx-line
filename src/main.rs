@@ -1,6 +1,3 @@
-mod fx;
-mod output;
-
 use std::{env, error::Error, io, io::Write, process::ExitCode};
 
 type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
@@ -29,7 +26,7 @@ fn run() -> Result<()> {
         return Err(io::Error::other("too many arguments").into());
     }
 
-    let command = fx::generate(&request, &cwd, &current_line)?;
+    let command = fx_line::fx::generate(&request, &cwd, &current_line)?;
     write!(io::stdout().lock(), "{command}")?;
     Ok(())
 }

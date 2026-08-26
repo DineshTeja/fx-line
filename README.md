@@ -1,21 +1,15 @@
 # fx-line
 
-Fast and easy-to-use natural-language commands for zsh in CMUX, powered by [Vercel fx](https://fx.sh). Control+Option toggles the input, Control+Command inserts a command, and Ctrl+C cancels. Written in Rust for cmux.
+Fast inline shell commands and an invisible CMUX voice agent, powered by [fx](https://fx.sh).
 
 ## Install
 
-Requires an installed and authenticated `fx`.
+Requires fx, CMUX, and Wispr Flow.
 
 ```sh
-cargo install --path .
+cargo install --path . --root ~/.local
 echo "source \"$PWD/fx-line.zsh\"" >> ~/.zshrc
+fx-agent install
 ```
 
-Add this CMUX/Ghostty binding:
-
-```ini
-keybind = ctrl+alt+left_alt=text:\x1b[99~
-keybind = ctrl+alt+left_control=text:\x1b[99~
-keybind = ctrl+super+left_super=text:\x1b[100~
-keybind = ctrl+super+left_control=text:\x1b[100~
-```
+Set Wispr’s `Fn+Control` shortcut to **Push to talk** while keeping `Fn`. For inline commands, bind `Control+Option` to `text:\x1b[99~` and `Control+Command` to `text:\x1b[100~` in Ghostty.

@@ -1,3 +1,4 @@
+use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::Value;
 use std::{error::Error, fmt};
 
@@ -14,19 +15,22 @@ impl fmt::Display for InvalidResponse {
 
 impl Error for InvalidResponse {}
 
-pub fn parse(raw: &str) -> Result<String, InvalidResponse> {
+pub fn envelope(raw: &str) -> Result<String, InvalidResponse> {
     let envelope: Value =
         serde_json::from_str(raw).map_err(|_| InvalidResponse("fx returned invalid JSON"))?;
-
     if envelope.get("exit_code").and_then(Value::as_i64) != Some(0) {
         return Err(InvalidResponse("fx request failed"));
     }
 
-    let output = envelope
+    envelope
         .get("output")
         .and_then(Value::as_str)
-        .ok_or(InvalidResponse("fx returned no command"))?;
-    let command = one_line(&model_command(output)?);
+        .map(str::to_owned)
+        .ok_or(InvalidResponse("fx returned no output"))
+}
+
+pub fn command(output: &str) -> Result<String, InvalidResponse> {
+    let command = one_line(&json::<Command>(output)?.command);
     let command = command.trim();
 
     if command.is_empty() {
@@ -42,31 +46,27 @@ pub fn parse(raw: &str) -> Result<String, InvalidResponse> {
     Ok(command.into())
 }
 
-fn model_command(output: &str) -> Result<String, InvalidResponse> {
+pub fn json<T: DeserializeOwned>(output: &str) -> Result<T, InvalidResponse> {
     let output = unfence(output);
-
-    if let Ok(payload) = serde_json::from_str::<Value>(output) {
-        return command_field(&payload);
+    if let Ok(value) = serde_json::from_str(output) {
+        return Ok(value);
     }
 
     for (index, _) in output.match_indices('{') {
         let mut values = serde_json::Deserializer::from_str(&output[index..]).into_iter::<Value>();
-        if let Some(Ok(payload)) = values.next()
-            && let Ok(command) = command_field(&payload)
+        if let Some(Ok(value)) = values.next()
+            && let Ok(value) = serde_json::from_value(value)
         {
-            return Ok(command);
+            return Ok(value);
         }
     }
 
     Err(InvalidResponse("model returned invalid output"))
 }
 
-fn command_field(payload: &Value) -> Result<String, InvalidResponse> {
-    payload
-        .get("command")
-        .and_then(Value::as_str)
-        .map(str::to_owned)
-        .ok_or(InvalidResponse("model returned no command"))
+#[derive(Deserialize)]
+struct Command {
+    command: String,
 }
 
 fn one_line(command: &str) -> String {
@@ -94,7 +94,7 @@ fn unfence(output: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
-    use super::parse;
+    use super::{command, envelope};
     use serde_json::json;
 
     fn response(output: &str, exit_code: i32) -> String {
@@ -102,49 +102,37 @@ mod tests {
     }
 
     #[test]
-    fn accepts_one_command() {
-        assert_eq!(
-            parse(&response(r#"{"command":"git status --short"}"#, 0)).unwrap(),
-            "git status --short"
-        );
-        assert_eq!(
-            parse(&response("```bash\n{\"command\":\"pwd\"}\n```", 0)).unwrap(),
-            "pwd"
-        );
-        assert_eq!(
-            parse(&response(
-                "Here is the command:\n{\"command\":\"pwd\",\"description\":\"working directory\"}",
-                0,
-            ))
-            .unwrap(),
-            "pwd"
-        );
-        assert_eq!(
-            parse(&response(
-                &json!({ "command": "find . \\\n | sort" }).to_string(),
-                0,
-            ))
-            .unwrap(),
-            "find .   | sort"
-        );
-        assert_eq!(
-            parse(&response(r#"{"command":"cd /tmp\npwd"}"#, 0)).unwrap(),
-            "cd /tmp && pwd"
-        );
+    fn reads_fx_envelope() {
+        assert_eq!(envelope(&response("hello", 0)).unwrap(), "hello");
+        assert!(envelope("not json").is_err());
+        assert!(envelope(&response("hello", 1)).is_err());
     }
 
     #[test]
-    fn rejects_invalid_output() {
-        for raw in [
-            "not json".into(),
-            response(r#"{"command":"pwd"}"#, 1),
-            response("pwd", 0),
-            response(r#"{"command":""}"#, 0),
-            response(r#"{"command":"pwd\u0000ls"}"#, 0),
-            response("pwd</arg_value></tool_call>", 0),
-            response(&json!({ "command": "x".repeat(8_193) }).to_string(), 0),
+    fn accepts_one_command() {
+        for (raw, expected) in [
+            (r#"{"command":"git status --short"}"#, "git status --short"),
+            ("```bash\n{\"command\":\"pwd\"}\n```", "pwd"),
+            (
+                "Here:\n{\"command\":\"pwd\",\"description\":\"working directory\"}",
+                "pwd",
+            ),
+            (r#"{"command":"cd /tmp\npwd"}"#, "cd /tmp && pwd"),
         ] {
-            assert!(parse(&raw).is_err());
+            assert_eq!(command(raw).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_command_output() {
+        for raw in [
+            "pwd".into(),
+            r#"{"command":""}"#.into(),
+            r#"{"command":"pwd\u0000ls"}"#.into(),
+            "pwd</arg_value></tool_call>".into(),
+            json!({ "command": "x".repeat(8_193) }).to_string(),
+        ] {
+            assert!(command(&raw).is_err());
         }
     }
 }

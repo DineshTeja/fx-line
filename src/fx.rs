@@ -9,18 +9,21 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-const DEFAULT_MODEL: &str = "zai/glm-4.7-flash";
+const DEFAULT_AGENT_MODEL: &str = "zai/glm-5.2-fast";
+const DEFAULT_LINE_MODEL: &str = "zai/glm-4.7-flash";
+const DEFAULT_PLAN_MODEL: &str = "thinkingmachines/inkling-small";
 const MAX_ATTEMPTS: usize = 2;
-const TIMEOUT: Duration = Duration::from_secs(5);
+const LINE_TIMEOUT: Duration = Duration::from_secs(5);
+const AGENT_TIMEOUT: Duration = Duration::from_secs(120);
 
 type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 
 pub fn generate(request: &str, cwd: &str, current_line: &str) -> Result<String> {
-    let prompt = prompt(request, cwd, current_line);
+    let prompt = line_prompt(request, cwd, current_line);
     let mut last_error = None;
 
     for _ in 0..MAX_ATTEMPTS {
-        match ask(&prompt) {
+        match complete(&prompt).and_then(|output| Ok(crate::output::command(&output)?)) {
             Ok(command) => return Ok(command),
             Err(error) => last_error = Some(error),
         }
@@ -29,9 +32,50 @@ pub fn generate(request: &str, cwd: &str, current_line: &str) -> Result<String> 
     Err(last_error.expect("at least one fx attempt"))
 }
 
-fn ask(prompt: &str) -> Result<String> {
-    let workspace = Workspace::new()?;
-    let model = env::var("FX_LINE_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.into());
+pub fn complete(prompt: &str) -> Result<String> {
+    request(
+        prompt,
+        None,
+        env::var("FX_LINE_MODEL").unwrap_or_else(|_| DEFAULT_LINE_MODEL.into()),
+        "ask",
+        0,
+        LINE_TIMEOUT,
+    )
+}
+
+pub fn plan(prompt: &str) -> Result<String> {
+    request(
+        prompt,
+        None,
+        env::var("FX_AGENT_PLAN_MODEL")
+            .or_else(|_| env::var("FX_LINE_MODEL"))
+            .unwrap_or_else(|_| DEFAULT_PLAN_MODEL.into()),
+        "ask",
+        0,
+        LINE_TIMEOUT,
+    )
+}
+
+pub fn run_agent(prompt: &str, cwd: &Path) -> Result<String> {
+    request(prompt, Some(cwd), agent_model(), "auto", 8, AGENT_TIMEOUT)
+}
+
+fn agent_model() -> String {
+    env::var("FX_AGENT_MODEL")
+        .or_else(|_| env::var("FX_LINE_MODEL"))
+        .unwrap_or_else(|_| DEFAULT_AGENT_MODEL.into())
+}
+
+fn request(
+    prompt: &str,
+    cwd: Option<&Path>,
+    model: String,
+    permission: &str,
+    max_steps: u8,
+    timeout: Duration,
+) -> Result<String> {
+    let workspace = cwd.is_none().then(Workspace::new).transpose()?;
+    let cwd = cwd.unwrap_or_else(|| workspace.as_ref().expect("temporary workspace").path());
     let binary = env::var_os("FX_LINE_FX").unwrap_or_else(|| "fx".into());
 
     let mut child = Command::new(binary)
@@ -42,10 +86,10 @@ fn ask(prompt: &str) -> Result<String> {
             "--json",
             "--no-color",
         ])
-        .current_dir(workspace.path())
+        .current_dir(cwd)
         .env("FX_MODEL", model)
-        .env("FX_PERMISSION_MODE", "ask")
-        .env("FX_MAX_AGENT_STEPS", "0")
+        .env("FX_PERMISSION_MODE", permission)
+        .env("FX_MAX_AGENT_STEPS", max_steps.to_string())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -56,13 +100,13 @@ fn ask(prompt: &str) -> Result<String> {
             .stdout
             .take()
             .ok_or_else(|| io::Error::other("fx stdout is unavailable"))?,
-    );
+    )?;
     let stderr = read_in_background(
         child
             .stderr
             .take()
             .ok_or_else(|| io::Error::other("fx stderr is unavailable"))?,
-    );
+    )?;
 
     let write_result = child
         .stdin
@@ -75,14 +119,14 @@ fn ask(prompt: &str) -> Result<String> {
         return Err(error.into());
     }
 
-    let (status, timed_out) = wait(&mut child)?;
+    let (status, timed_out) = wait(&mut child, timeout)?;
     let stdout = String::from_utf8(join(stdout)?)?;
     let stderr = String::from_utf8(join(stderr)?)?;
 
     if timed_out {
         return Err(io::Error::new(
             io::ErrorKind::TimedOut,
-            format!("fx timed out after {} seconds", TIMEOUT.as_secs()),
+            format!("fx timed out after {} seconds", timeout.as_secs()),
         )
         .into());
     }
@@ -91,14 +135,16 @@ fn ask(prompt: &str) -> Result<String> {
         return Err(io::Error::other(detail.unwrap_or("fx failed")).into());
     }
 
-    Ok(crate::output::parse(&stdout)?)
+    Ok(crate::output::envelope(&stdout)?)
 }
 
-fn prompt(request: &str, cwd: &str, current_line: &str) -> String {
+fn line_prompt(request: &str, cwd: &str, current_line: &str) -> String {
+    let directory = crate::context::directory(Path::new(cwd));
     let context = serde_json::json!({
         "request": request,
         "cwd": cwd,
         "current_line": current_line,
+        "directory": directory,
     });
 
     format!(
@@ -106,15 +152,18 @@ fn prompt(request: &str, cwd: &str, current_line: &str) -> String {
     )
 }
 
-fn read_in_background<R>(mut reader: R) -> JoinHandle<io::Result<Vec<u8>>>
+fn read_in_background<R>(mut reader: R) -> io::Result<JoinHandle<io::Result<Vec<u8>>>>
 where
     R: Read + Send + 'static,
 {
-    thread::spawn(move || {
-        let mut bytes = Vec::new();
-        reader.read_to_end(&mut bytes)?;
-        Ok(bytes)
-    })
+    thread::Builder::new()
+        .name("fx-output".into())
+        .stack_size(128 * 1024)
+        .spawn(move || {
+            let mut bytes = Vec::new();
+            reader.read_to_end(&mut bytes)?;
+            Ok(bytes)
+        })
 }
 
 fn join(reader: JoinHandle<io::Result<Vec<u8>>>) -> io::Result<Vec<u8>> {
@@ -123,13 +172,13 @@ fn join(reader: JoinHandle<io::Result<Vec<u8>>>) -> io::Result<Vec<u8>> {
         .map_err(|_| io::Error::other("fx output reader panicked"))?
 }
 
-fn wait(child: &mut Child) -> io::Result<(ExitStatus, bool)> {
+fn wait(child: &mut Child, timeout: Duration) -> io::Result<(ExitStatus, bool)> {
     let started = Instant::now();
     loop {
         if let Some(status) = child.try_wait()? {
             return Ok((status, false));
         }
-        if started.elapsed() >= TIMEOUT {
+        if started.elapsed() >= timeout {
             let _ = child.kill();
             return child.wait().map(|status| (status, true));
         }
@@ -163,15 +212,17 @@ impl Drop for Workspace {
 
 #[cfg(test)]
 mod tests {
-    use super::prompt;
+    use super::line_prompt;
 
     #[test]
-    fn prompt_encodes_context_as_data() {
-        let prompt = prompt("find \"notes\"", "/tmp/a b", "git ");
+    fn prompt_encodes_directory_context_as_data() {
+        let prompt = line_prompt("find \"notes\"", "/missing/a b", "git ");
+        let (_, context) = prompt.split_once('\n').unwrap();
+        let context: serde_json::Value = serde_json::from_str(context).unwrap();
 
-        assert_eq!(
-            prompt,
-            "Return one macOS zsh command without using tools. The shell is already at cwd. Reply only with JSON: {\"command\":\"...\"}.\n{\"current_line\":\"git \",\"cwd\":\"/tmp/a b\",\"request\":\"find \\\"notes\\\"\"}"
-        );
+        assert_eq!(context["request"], "find \"notes\"");
+        assert_eq!(context["cwd"], "/missing/a b");
+        assert_eq!(context["current_line"], "git ");
+        assert_eq!(context["directory"]["entries"], serde_json::json!([]));
     }
 }
