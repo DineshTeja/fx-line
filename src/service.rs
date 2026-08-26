@@ -35,7 +35,7 @@ pub fn install(binary: &Path) -> io::Result<()> {
             .args(["kickstart", "-k", &service])
             .output()?,
     )?;
-    thread::sleep(Duration::from_millis(300));
+    thread::sleep(Duration::from_millis(1_500));
     if is_running()? {
         Ok(())
     } else {
