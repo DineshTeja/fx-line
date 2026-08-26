@@ -10,13 +10,27 @@ use std::{
 };
 
 const DEFAULT_MODEL: &str = "zai/glm-4.7-flash";
+const MAX_ATTEMPTS: usize = 2;
 const TIMEOUT: Duration = Duration::from_secs(5);
 
 type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 
 pub fn generate(request: &str, cwd: &str, current_line: &str) -> Result<String> {
+    let prompt = prompt(request, cwd, current_line);
+    let mut last_error = None;
+
+    for _ in 0..MAX_ATTEMPTS {
+        match ask(&prompt) {
+            Ok(command) => return Ok(command),
+            Err(error) => last_error = Some(error),
+        }
+    }
+
+    Err(last_error.expect("at least one fx attempt"))
+}
+
+fn ask(prompt: &str) -> Result<String> {
     let workspace = Workspace::new()?;
-    let prompt = prompt(request, cwd, current_line)?;
     let model = env::var("FX_LINE_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.into());
     let binary = env::var_os("FX_LINE_FX").unwrap_or_else(|| "fx".into());
 
@@ -80,13 +94,16 @@ pub fn generate(request: &str, cwd: &str, current_line: &str) -> Result<String> 
     Ok(crate::output::parse(&stdout)?)
 }
 
-fn prompt(request: &str, cwd: &str, current_line: &str) -> Result<String> {
-    Ok(format!(
-        "Return one macOS zsh command without using tools. The shell is already in cwd.\nReply only as JSON: {{\"command\":\"...\"}}\nrequest={}\ncwd={}\ninput={}",
-        serde_json::to_string(request)?,
-        serde_json::to_string(cwd)?,
-        serde_json::to_string(current_line)?,
-    ))
+fn prompt(request: &str, cwd: &str, current_line: &str) -> String {
+    let context = serde_json::json!({
+        "request": request,
+        "cwd": cwd,
+        "current_line": current_line,
+    });
+
+    format!(
+        "Return one macOS zsh command without using tools. The shell is already at cwd. Reply only with JSON: {{\"command\":\"...\"}}.\n{context}"
+    )
 }
 
 fn read_in_background<R>(mut reader: R) -> JoinHandle<io::Result<Vec<u8>>>
@@ -150,11 +167,11 @@ mod tests {
 
     #[test]
     fn prompt_encodes_context_as_data() {
-        let prompt = prompt("find \"notes\"", "/tmp/a b", "git ").unwrap();
+        let prompt = prompt("find \"notes\"", "/tmp/a b", "git ");
 
         assert_eq!(
             prompt,
-            "Return one macOS zsh command without using tools. The shell is already in cwd.\nReply only as JSON: {\"command\":\"...\"}\nrequest=\"find \\\"notes\\\"\"\ncwd=\"/tmp/a b\"\ninput=\"git \""
+            "Return one macOS zsh command without using tools. The shell is already at cwd. Reply only with JSON: {\"command\":\"...\"}.\n{\"current_line\":\"git \",\"cwd\":\"/tmp/a b\",\"request\":\"find \\\"notes\\\"\"}"
         );
     }
 }

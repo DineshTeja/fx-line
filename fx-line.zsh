@@ -68,7 +68,7 @@ _fx_line_submit() {
   local request=$BUFFER
   local saved_buffer=$_FX_LINE_SAVED_BUFFER
   local saved_cursor=$_FX_LINE_SAVED_CURSOR
-  local binary command_text exit_status
+  local binary command_text error_text exit_status
 
   if [[ -z ${request//[[:space:]]/} ]]; then
     POSTDISPLAY='  type a request'
@@ -87,7 +87,7 @@ _fx_line_submit() {
 
   POSTDISPLAY='  …'
   zle -R
-  command_text=$(command "$binary" "$request" "$PWD" "$saved_buffer" 2>/dev/null)
+  command_text=$(command "$binary" "$request" "$PWD" "$saved_buffer" 2>&1)
   exit_status=$?
 
   _fx_line_restore
@@ -95,12 +95,13 @@ _fx_line_submit() {
     BUFFER=$command_text
     CURSOR=${#BUFFER}
   else
+    error_text=${command_text#fx-line: }
     BUFFER=$saved_buffer
     CURSOR=$saved_cursor
   fi
   zle reset-prompt
 
-  (( exit_status == 0 )) || zle -M 'fx-line: generation failed'
+  (( exit_status == 0 )) || zle -M "fx-line: ${error_text:-generation failed}"
 }
 
 _fx_line_precmd() {

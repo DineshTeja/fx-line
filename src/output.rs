@@ -26,7 +26,7 @@ pub fn parse(raw: &str) -> Result<String, InvalidResponse> {
         .get("output")
         .and_then(Value::as_str)
         .ok_or(InvalidResponse("fx returned no command"))?;
-    let command = one_line(&model_command(unfence(output))?);
+    let command = one_line(&model_command(output)?);
     let command = command.trim();
 
     if command.is_empty() {
@@ -43,24 +43,26 @@ pub fn parse(raw: &str) -> Result<String, InvalidResponse> {
 }
 
 fn model_command(output: &str) -> Result<String, InvalidResponse> {
-    let Ok(payload) = serde_json::from_str::<Value>(output) else {
-        if output.starts_with('{')
-            || output.starts_with('[')
-            || output.contains("</")
-            || output.contains("```")
-        {
-            return Err(InvalidResponse("model returned invalid output"));
-        }
-        return Ok(output.into());
-    };
-    let object = payload
-        .as_object()
-        .ok_or(InvalidResponse("model returned invalid JSON"))?;
-    if object.len() != 1 {
-        return Err(InvalidResponse("model returned unexpected fields"));
+    let output = unfence(output);
+
+    if let Ok(payload) = serde_json::from_str::<Value>(output) {
+        return command_field(&payload);
     }
 
-    object
+    for (index, _) in output.match_indices('{') {
+        let mut values = serde_json::Deserializer::from_str(&output[index..]).into_iter::<Value>();
+        if let Some(Ok(payload)) = values.next()
+            && let Ok(command) = command_field(&payload)
+        {
+            return Ok(command);
+        }
+    }
+
+    Err(InvalidResponse("model returned invalid output"))
+}
+
+fn command_field(payload: &Value) -> Result<String, InvalidResponse> {
+    payload
         .get("command")
         .and_then(Value::as_str)
         .map(str::to_owned)
@@ -109,7 +111,14 @@ mod tests {
             parse(&response("```bash\n{\"command\":\"pwd\"}\n```", 0)).unwrap(),
             "pwd"
         );
-        assert_eq!(parse(&response("pwd", 0)).unwrap(), "pwd");
+        assert_eq!(
+            parse(&response(
+                "Here is the command:\n{\"command\":\"pwd\",\"description\":\"working directory\"}",
+                0,
+            ))
+            .unwrap(),
+            "pwd"
+        );
         assert_eq!(
             parse(&response(
                 &json!({ "command": "find . \\\n | sort" }).to_string(),
@@ -129,9 +138,8 @@ mod tests {
         for raw in [
             "not json".into(),
             response(r#"{"command":"pwd"}"#, 1),
-            response("result:\n```json\n{\"command\":\"pwd\"}\n```", 0),
+            response("pwd", 0),
             response(r#"{"command":""}"#, 0),
-            response(r#"{"command":"pwd","note":"extra"}"#, 0),
             response(r#"{"command":"pwd\u0000ls"}"#, 0),
             response("pwd</arg_value></tool_call>", 0),
             response(&json!({ "command": "x".repeat(8_193) }).to_string(), 0),
