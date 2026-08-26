@@ -1,6 +1,6 @@
 # fx-line
 
-Inline natural-language commands for zsh in CMUX, powered by [Vercel fx](https://fx.sh). Control+Option toggles the input, Control+Command inserts a command, and Ctrl+C cancels.
+Fast and easy-to-use natural-language commands for zsh in CMUX, powered by [Vercel fx](https://fx.sh). Control+Option toggles the input, Control+Command inserts a command, and Ctrl+C cancels. Written in Rust for cmux.
 
 ## Install
 
