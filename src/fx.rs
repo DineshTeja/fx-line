@@ -9,8 +9,8 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-const DEFAULT_MODEL: &str = "mistral/mistral-small";
-const TIMEOUT: Duration = Duration::from_secs(4);
+const DEFAULT_MODEL: &str = "zai/glm-4.7-flash";
+const TIMEOUT: Duration = Duration::from_secs(5);
 
 type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 
@@ -31,7 +31,7 @@ pub fn generate(request: &str, cwd: &str, current_line: &str) -> Result<String> 
         .current_dir(workspace.path())
         .env("FX_MODEL", model)
         .env("FX_PERMISSION_MODE", "ask")
-        .env("FX_MAX_AGENT_STEPS", "1")
+        .env("FX_MAX_AGENT_STEPS", "0")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -66,7 +66,11 @@ pub fn generate(request: &str, cwd: &str, current_line: &str) -> Result<String> 
     let stderr = String::from_utf8(join(stderr)?)?;
 
     if timed_out {
-        return Err(io::Error::new(io::ErrorKind::TimedOut, "fx timed out after 4 seconds").into());
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!("fx timed out after {} seconds", TIMEOUT.as_secs()),
+        )
+        .into());
     }
     if !status.success() {
         let detail = stderr.lines().find(|line| !line.trim().is_empty());

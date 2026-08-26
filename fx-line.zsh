@@ -2,7 +2,7 @@
 
 [[ -o interactive ]] || return 0 2>/dev/null || exit 0
 
-autoload -Uz add-zle-hook-widget
+autoload -Uz add-zsh-hook
 
 typeset -gi _FX_LINE_ACTIVE=0
 typeset -g _FX_LINE_SAVED_BUFFER=''
@@ -103,7 +103,7 @@ _fx_line_submit() {
   (( exit_status == 0 )) || zle -M 'fx-line: generation failed'
 }
 
-_fx_line_finish() {
+_fx_line_precmd() {
   if (( _FX_LINE_ACTIVE )); then
     PROMPT=$_FX_LINE_SAVED_PROMPT
     RPROMPT=$_FX_LINE_SAVED_RPROMPT
@@ -123,10 +123,11 @@ bindkey -M fx-line '^[' fx-line-cancel
 bindkey -M fx-line '^C' fx-line-cancel
 bindkey -M fx-line '^G' fx-line-cancel
 bindkey -M fx-line $'\e[99~' fx-line-cancel
+bindkey -M fx-line $'\e[100~' fx-line-submit
 
 bindkey -M emacs $'\e[99~' fx-line-open 2>/dev/null
 bindkey -M viins $'\e[99~' fx-line-open 2>/dev/null
 bindkey -M vicmd $'\e[99~' fx-line-open 2>/dev/null
 
-add-zle-hook-widget -d line-finish _fx_line_finish 2>/dev/null
-add-zle-hook-widget line-finish _fx_line_finish
+add-zsh-hook -d precmd _fx_line_precmd 2>/dev/null
+add-zsh-hook precmd _fx_line_precmd

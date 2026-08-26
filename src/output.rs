@@ -26,19 +26,8 @@ pub fn parse(raw: &str) -> Result<String, InvalidResponse> {
         .get("output")
         .and_then(Value::as_str)
         .ok_or(InvalidResponse("fx returned no command"))?;
-    let payload: Value = serde_json::from_str(output.trim())
-        .map_err(|_| InvalidResponse("model returned invalid JSON"))?;
-    let object = payload
-        .as_object()
-        .ok_or(InvalidResponse("model returned invalid JSON"))?;
-    if object.len() != 1 {
-        return Err(InvalidResponse("model returned unexpected fields"));
-    }
-    let command = object
-        .get("command")
-        .and_then(Value::as_str)
-        .ok_or(InvalidResponse("model returned no command"))?
-        .trim();
+    let command = one_line(&model_command(unfence(output))?);
+    let command = command.trim();
 
     if command.is_empty() {
         return Err(InvalidResponse("fx returned a blank command"));
@@ -51,6 +40,54 @@ pub fn parse(raw: &str) -> Result<String, InvalidResponse> {
     }
 
     Ok(command.into())
+}
+
+fn model_command(output: &str) -> Result<String, InvalidResponse> {
+    let Ok(payload) = serde_json::from_str::<Value>(output) else {
+        if output.starts_with('{')
+            || output.starts_with('[')
+            || output.contains("</")
+            || output.contains("```")
+        {
+            return Err(InvalidResponse("model returned invalid output"));
+        }
+        return Ok(output.into());
+    };
+    let object = payload
+        .as_object()
+        .ok_or(InvalidResponse("model returned invalid JSON"))?;
+    if object.len() != 1 {
+        return Err(InvalidResponse("model returned unexpected fields"));
+    }
+
+    object
+        .get("command")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .ok_or(InvalidResponse("model returned no command"))
+}
+
+fn one_line(command: &str) -> String {
+    command
+        .replace("\\\r\n", " ")
+        .replace("\\\n", " ")
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" && ")
+}
+
+fn unfence(output: &str) -> &str {
+    let output = output.trim();
+    let Some((header, body)) = output.split_once('\n') else {
+        return output;
+    };
+    if !header.starts_with("```") {
+        return output;
+    }
+
+    body.strip_suffix("```").map(str::trim).unwrap_or(output)
 }
 
 #[cfg(test)]
@@ -68,6 +105,23 @@ mod tests {
             parse(&response(r#"{"command":"git status --short"}"#, 0)).unwrap(),
             "git status --short"
         );
+        assert_eq!(
+            parse(&response("```bash\n{\"command\":\"pwd\"}\n```", 0)).unwrap(),
+            "pwd"
+        );
+        assert_eq!(parse(&response("pwd", 0)).unwrap(), "pwd");
+        assert_eq!(
+            parse(&response(
+                &json!({ "command": "find . \\\n | sort" }).to_string(),
+                0,
+            ))
+            .unwrap(),
+            "find .   | sort"
+        );
+        assert_eq!(
+            parse(&response(r#"{"command":"cd /tmp\npwd"}"#, 0)).unwrap(),
+            "cd /tmp && pwd"
+        );
     }
 
     #[test]
@@ -75,11 +129,11 @@ mod tests {
         for raw in [
             "not json".into(),
             response(r#"{"command":"pwd"}"#, 1),
-            response("pwd", 0),
+            response("result:\n```json\n{\"command\":\"pwd\"}\n```", 0),
             response(r#"{"command":""}"#, 0),
             response(r#"{"command":"pwd","note":"extra"}"#, 0),
-            response(r#"{"command":"pwd\nls"}"#, 0),
             response(r#"{"command":"pwd\u0000ls"}"#, 0),
+            response("pwd</arg_value></tool_call>", 0),
             response(&json!({ "command": "x".repeat(8_193) }).to_string(), 0),
         ] {
             assert!(parse(&raw).is_err());
