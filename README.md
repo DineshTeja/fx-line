@@ -12,4 +12,4 @@ echo "source \"$PWD/fx-line.zsh\"" >> ~/.zshrc
 fx-agent install
 ```
 
-Set Wispr’s `Fn+Control` shortcut to **Push to talk** while keeping `Fn`. For inline commands, bind `Control+Option` to `text:\x1b[99~` and `Control+Command` to `text:\x1b[100~` in Ghostty.
+`Fn` stays normal Wispr dictation; `Fn+Control` speaks to the CMUX agent. For inline commands, bind `Control+Option` to `text:\x1b[99~` and `Control+Command` to `text:\x1b[100~` in Ghostty.

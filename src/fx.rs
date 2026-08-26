@@ -10,12 +10,12 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-const DEFAULT_AGENT_MODEL: &str = "zai/glm-5.2-fast";
+const DEFAULT_AGENT_MODEL: &str = "zai/glm-4.7-flash";
 const DEFAULT_LINE_MODEL: &str = "zai/glm-4.7-flash";
 const DEFAULT_PLAN_MODEL: &str = "zai/glm-4.7-flash";
 const MAX_ATTEMPTS: usize = 2;
 const LINE_TIMEOUT: Duration = Duration::from_secs(5);
-const AGENT_TIMEOUT: Duration = Duration::from_secs(120);
+const AGENT_TIMEOUT: Duration = Duration::from_secs(20);
 
 type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 

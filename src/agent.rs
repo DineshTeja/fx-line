@@ -26,7 +26,7 @@ Every request needs actions or fallback=true. Never use tools.
 Actions: open_browser(url,[direction]); new_terminal(direction); focus_pane(pane); swap_panes(pane,target); resize_pane(pane,direction,amount); move_surface(surface,pane); split_surface(surface,direction); new_workspace([name],[cwd]); select_workspace(workspace); rename_workspace(name,[workspace]); rename_tab(name,[surface]); open(target); sidebar(action); flash; close_surface([surface]); close_workspace([workspace]).
 Directions: left/right/up/down. Sidebar: show/hide/toggle/focus. Use only context refs. Never close unless asked.
 Use pane and surface refs only from cmux.tree. Use cmux.workspaces refs only to select a workspace.
-Use fallback=true, with no actions, for filesystem, shell, browser interaction, or CMUX work outside the schema.
+Prefer direct actions whenever the schema can satisfy the request. Use open_browser for a site, URL, or site name by itself. Use fallback=true, with no actions, only for filesystem or shell work, interaction inside an existing web page, or CMUX work outside the schema.
 Example for open GitHub and Google: {"actions":[{"kind":"open_browser","url":"https://github.com","direction":"right"},{"kind":"open_browser","url":"https://google.com","direction":"down"}],"fallback":false,"message":"Opened two browsers"}."#;
 
 type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
@@ -35,9 +35,9 @@ type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 pub enum Event {
     Ready,
     Unavailable,
-    Pressed(SystemTime),
+    Pressed,
     Released,
-    Paste,
+    Transcript(String),
     Cancelled,
 }
 
@@ -66,8 +66,12 @@ pub fn run_daemon() -> Result<()> {
         thread::Builder::new()
             .name("fx-agent-hotkey".into())
             .stack_size(256 * 1024)
-            .spawn(move || listen(sender))?;
-        crate::indicator::run(indicator)?;
+            .spawn({
+                let indicator = indicator.clone();
+                let sender = sender.clone();
+                move || listen(sender, indicator)
+            })?;
+        crate::indicator::run(indicator, sender)?;
         Ok(())
     }
 
@@ -78,10 +82,10 @@ pub fn run_daemon() -> Result<()> {
 }
 
 #[cfg(target_os = "macos")]
-fn listen(sender: mpsc::Sender<Event>) {
+fn listen(sender: mpsc::Sender<Event>, indicator: Indicator) {
     let mut reported = false;
     loop {
-        match crate::hotkey::listen(sender.clone()) {
+        match crate::hotkey::listen(sender.clone(), indicator.clone()) {
             Ok(()) => {
                 reported = false;
                 thread::sleep(Duration::from_millis(100));
@@ -124,7 +128,6 @@ pub fn run_request(request: &str) -> Result<String> {
 fn worker(receiver: Receiver<Event>, indicator: Indicator) {
     let cmux = Cmux::new();
     let mut context = None;
-    let mut capture = None;
     let mut awaiting_transcript = false;
     let _ = cmux.clear_agent_statuses();
 
@@ -135,7 +138,7 @@ fn worker(receiver: Receiver<Event>, indicator: Indicator) {
                 Err(RecvTimeoutError::Timeout) => {
                     awaiting_transcript = false;
                     context = None;
-                    capture = None;
+                    indicator.cancel_capture();
                     indicator.set(Phase::Ready);
                     None
                 }
@@ -155,9 +158,8 @@ fn worker(receiver: Receiver<Event>, indicator: Indicator) {
             Some(Event::Unavailable) => {
                 indicator.set(Phase::Off);
             }
-            Some(Event::Pressed(pressed_at)) => {
+            Some(Event::Pressed) => {
                 awaiting_transcript = false;
-                capture = Some(crate::wispr::capture(pressed_at));
                 context = match cmux.context() {
                     Ok(context) => Some(context),
                     Err(error) => {
@@ -171,7 +173,7 @@ fn worker(receiver: Receiver<Event>, indicator: Indicator) {
                 awaiting_transcript = true;
                 indicator.set(Phase::Transcribing);
             }
-            Some(Event::Paste) => {
+            Some(Event::Transcript(request)) => {
                 awaiting_transcript = false;
                 let context = context.take().or_else(|| match cmux.context() {
                     Ok(context) => Some(context),
@@ -180,14 +182,12 @@ fn worker(receiver: Receiver<Event>, indicator: Indicator) {
                         None
                     }
                 });
-                let result = match (context.as_ref(), capture.take()) {
-                    (Some(context), Some(capture)) => {
-                        crate::wispr::transcript(capture).and_then(|request| {
-                            indicator.set(Phase::Working);
-                            run_with_context(&cmux, context, request.trim()).map(|_| ())
-                        })
+                let result = match context.as_ref() {
+                    Some(context) => {
+                        indicator.set(Phase::Working);
+                        run_with_context(&cmux, context, request.trim()).map(|_| ())
                     }
-                    _ => {
+                    None => {
                         Err(io::Error::other("could not capture the focused CMUX workspace").into())
                     }
                 };
@@ -206,7 +206,7 @@ fn worker(receiver: Receiver<Event>, indicator: Indicator) {
             Some(Event::Cancelled) => {
                 awaiting_transcript = false;
                 context = None;
-                capture = None;
+                indicator.cancel_capture();
                 indicator.set(Phase::Ready);
             }
             None => {}
@@ -232,7 +232,7 @@ fn report(error: impl Display) {
 
 fn run_with_context(cmux: &Cmux, context: &Context, request: &str) -> Result<String> {
     if request.is_empty() {
-        return Err(io::Error::other("Wispr returned an empty transcript").into());
+        return Err(io::Error::other("the request is empty").into());
     }
     let plan = create_plan(request, context)?;
     for action in &plan.actions {
@@ -266,6 +266,18 @@ fn run_with_context(cmux: &Cmux, context: &Context, request: &str) -> Result<Str
 }
 
 fn create_plan(request: &str, context: &Context) -> Result<Plan> {
+    if let Some(intent) = crate::intent::parse(request) {
+        let plan = Plan {
+            actions: vec![intent.action],
+            fallback: false,
+            message: intent.message,
+        };
+        for action in &plan.actions {
+            Cmux::new().validate(context, request, action)?;
+        }
+        return Ok(plan);
+    }
+
     let mut prompt = plan_prompt(request, context);
     let mut last_error = None;
     for _ in 0..PLAN_ATTEMPTS {

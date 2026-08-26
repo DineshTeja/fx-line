@@ -1,7 +1,7 @@
 mod actions;
 mod validation;
 
-pub use actions::Action;
+pub use actions::{Action, Direction};
 use serde::{Deserialize, Serialize};
 use std::{
     env,

@@ -1,200 +1,221 @@
-use rusqlite::{Connection, OpenFlags, OptionalExtension};
+use serde_json::{Map, Value};
 use std::{
-    env,
-    error::Error,
-    io,
-    path::PathBuf,
+    fs, io,
+    path::{Path, PathBuf},
+    process::{Command, Output},
     thread,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant},
 };
 
-const LOOKUP_TIMEOUT: Duration = Duration::from_secs(2);
-const POLL_INTERVAL: Duration = Duration::from_millis(10);
-const CLOCK_SLOP: f64 = 0.25;
+const FLOW_SHORTCUT: &str = "59+63";
+const FLOW_PTT: &str = "ptt";
+const FLOW_COMMAND_MODE: &str = "lens";
+const FLOW_BINARY: &str = "/Applications/Wispr Flow.app/Contents/MacOS/Wispr Flow";
+const FLOW_GRACEFUL_STOP: Duration = Duration::from_secs(1);
+const FLOW_STOP_TIMEOUT: Duration = Duration::from_secs(5);
+const OLD_EXTENSION: &str = "fx-agent";
 
-type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
-
-#[derive(Debug)]
-pub struct Capture {
-    completed_rowid: Option<i64>,
-    started: f64,
+pub fn install(home: &Path) -> io::Result<()> {
+    remove_old_extension(home)?;
+    set_shortcut(home, FLOW_PTT)
 }
 
-pub fn capture(started: SystemTime) -> Capture {
-    let started = started
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs_f64()
-        - CLOCK_SLOP;
-    let completed_rowid = open()
-        .ok()
-        .and_then(|connection| checkpoint(&connection).ok());
-
-    Capture {
-        completed_rowid,
-        started,
-    }
+pub fn uninstall(home: &Path) -> io::Result<()> {
+    remove_old_extension(home)?;
+    set_shortcut(home, FLOW_COMMAND_MODE)
 }
 
-pub fn transcript(capture: Capture) -> Result<String> {
-    let connection = open()?;
-    let deadline = Instant::now() + LOOKUP_TIMEOUT;
-
-    loop {
-        let transcript = match capture.completed_rowid {
-            Some(rowid) => latest_after(&connection, rowid)?,
-            None => latest_since(&connection, capture.started)?,
-        };
-        if let Some(transcript) = transcript {
-            let transcript = transcript.trim();
-            if !transcript.is_empty() {
-                return Ok(transcript.to_owned());
-            }
-        }
-        if Instant::now() >= deadline {
-            return Err(io::Error::other("Wispr transcript did not become available").into());
-        }
-        thread::sleep(POLL_INTERVAL);
-    }
-}
-
-fn open() -> Result<Connection> {
-    let connection = Connection::open_with_flags(
-        database_path()?,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+pub fn stop_if_running() -> io::Result<bool> {
+    let Some(pid) = process_id()? else {
+        return Ok(false);
+    };
+    checked(
+        Command::new("/usr/bin/osascript")
+            .args(["-e", "tell application \"Wispr Flow\" to quit"])
+            .output()?,
     )?;
-    connection.busy_timeout(Duration::from_millis(50))?;
-    Ok(connection)
+    let started = Instant::now();
+    while started.elapsed() < FLOW_GRACEFUL_STOP {
+        if process_id()?.is_none() {
+            return Ok(true);
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    let _ = Command::new("/bin/kill").arg(pid.to_string()).output();
+    while started.elapsed() < FLOW_STOP_TIMEOUT {
+        if process_id()?.is_none() {
+            return Ok(true);
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    Err(io::Error::other("Wispr Flow did not stop"))
 }
 
-fn checkpoint(connection: &Connection) -> rusqlite::Result<i64> {
-    connection.query_row(
-        r#"SELECT COALESCE(MAX(rowid), 0)
-           FROM History
-           WHERE app = 'com.cmuxterm.app'
-             AND transcriptCommand = 'ptt'
-             AND status = 'formatted'"#,
-        [],
-        |row| row.get(0),
-    )
+pub fn start() -> io::Result<()> {
+    checked(
+        Command::new("/usr/bin/open")
+            .args(["-j", "-a", "/Applications/Wispr Flow.app"])
+            .output()?,
+    )?;
+    Ok(())
 }
 
-fn latest_after(connection: &Connection, rowid: i64) -> rusqlite::Result<Option<String>> {
-    connection
-        .query_row(
-            r#"SELECT COALESCE(
-                   NULLIF(pastedText, ''),
-                   NULLIF(formattedText, ''),
-                   NULLIF(serverFinalizedText, ''),
-                   NULLIF(asrText, '')
-               )
-               FROM History
-               WHERE app = 'com.cmuxterm.app'
-                 AND transcriptCommand = 'ptt'
-                 AND status = 'formatted'
-                 AND rowid > ?1
-               ORDER BY rowid ASC
-               LIMIT 1"#,
-            [rowid],
-            |row| row.get(0),
-        )
-        .optional()
+fn set_shortcut(home: &Path, action: &str) -> io::Result<()> {
+    let config = flow_root(home).join("config.json");
+    update_json(&config, Value::Null, |value| {
+        object_at(value, &["prefs", "user", "shortcuts"])?
+            .insert(FLOW_SHORTCUT.into(), Value::String(action.into()));
+        Ok(())
+    })
 }
 
-fn latest_since(connection: &Connection, started: f64) -> rusqlite::Result<Option<String>> {
-    connection
-        .query_row(
-            r#"SELECT COALESCE(
-                   NULLIF(pastedText, ''),
-                   NULLIF(formattedText, ''),
-                   NULLIF(serverFinalizedText, ''),
-                   NULLIF(asrText, '')
-               )
-               FROM History
-               WHERE app = 'com.cmuxterm.app'
-                 AND transcriptCommand = 'ptt'
-                 AND status = 'formatted'
-                 AND (julianday(timestamp) - 2440587.5) * 86400.0 >= ?1
-               ORDER BY timestamp ASC
-               LIMIT 1"#,
-            [started],
-            |row| row.get(0),
-        )
-        .optional()
+fn remove_old_extension(home: &Path) -> io::Result<()> {
+    let root = bridge_root(home);
+    let flow_extensions = flow_root(home).join("extensions");
+    let custom_paths = flow_extensions.join("custom-paths.json");
+    let enabled_state = flow_extensions.join("extensions-state.json");
+
+    if custom_paths.exists() {
+        update_json(&custom_paths, Value::Array(Vec::new()), |value| {
+            let paths = value.as_array_mut().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "invalid Wispr custom paths")
+            })?;
+            let root = root.to_string_lossy();
+            paths.retain(|path| path.as_str() != Some(root.as_ref()));
+            Ok(())
+        })?;
+    }
+    if enabled_state.exists() {
+        update_json(&enabled_state, Value::Object(Map::new()), |value| {
+            object(value, "invalid Wispr extension state")?.remove(OLD_EXTENSION);
+            Ok(())
+        })?;
+    }
+    remove_dir(&root)?;
+    remove_file(&state_root(home).join("agent.sock"))
 }
 
-fn database_path() -> Result<PathBuf> {
-    let home = env::var_os("HOME")
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "HOME is unavailable"))?;
-    Ok(PathBuf::from(home).join("Library/Application Support/Wispr Flow/flow.sqlite"))
+fn process_id() -> io::Result<Option<u32>> {
+    let output = checked(
+        Command::new("/bin/ps")
+            .args(["-axo", "pid=,command="])
+            .output()?,
+    )?;
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let line = line.trim();
+        let Some((pid, command)) = line.split_once(char::is_whitespace) else {
+            continue;
+        };
+        if command.trim() == FLOW_BINARY {
+            return pid.parse().map(Some).map_err(io::Error::other);
+        }
+    }
+    Ok(None)
+}
+
+fn update_json(
+    path: &Path,
+    default: Value,
+    update: impl FnOnce(&mut Value) -> io::Result<()>,
+) -> io::Result<()> {
+    let mut value = match fs::read(path) {
+        Ok(contents) => serde_json::from_slice(&contents).map_err(io::Error::other)?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => default,
+        Err(error) => return Err(error),
+    };
+    update(&mut value)?;
+    let mut contents = serde_json::to_vec_pretty(&value).map_err(io::Error::other)?;
+    contents.push(b'\n');
+    replace(path, &contents)
+}
+
+fn object<'a>(
+    value: &'a mut Value,
+    message: &'static str,
+) -> io::Result<&'a mut Map<String, Value>> {
+    value
+        .as_object_mut()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, message))
+}
+
+fn object_at<'a>(value: &'a mut Value, path: &[&str]) -> io::Result<&'a mut Map<String, Value>> {
+    let mut value = value;
+    for key in path {
+        value = value.get_mut(*key).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Wispr config is missing {}", path.join(".")),
+            )
+        })?;
+    }
+    object(value, "Wispr shortcuts are not an object")
+}
+
+fn replace(path: &Path, contents: &[u8]) -> io::Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::other("destination has no parent"))?;
+    fs::create_dir_all(parent)?;
+    let pending = path.with_extension("new");
+    fs::write(&pending, contents)?;
+    if let Ok(metadata) = fs::metadata(path) {
+        fs::set_permissions(&pending, metadata.permissions())?;
+    }
+    fs::rename(pending, path)
+}
+
+fn remove_file(path: &Path) -> io::Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn remove_dir(path: &Path) -> io::Result<()> {
+    match fs::remove_dir_all(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn state_root(home: &Path) -> PathBuf {
+    home.join("Library/Application Support/fx-line")
+}
+
+fn bridge_root(home: &Path) -> PathBuf {
+    state_root(home).join("wispr")
+}
+
+fn flow_root(home: &Path) -> PathBuf {
+    home.join("Library/Application Support/Wispr Flow")
+}
+
+fn checked(output: Output) -> io::Result<Output> {
+    if output.status.success() {
+        return Ok(output);
+    }
+    let message = String::from_utf8_lossy(&output.stderr)
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or("command failed")
+        .to_owned();
+    Err(io::Error::other(message))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{checkpoint, latest_after, latest_since};
-    use rusqlite::Connection;
+    use super::{FLOW_PTT, FLOW_SHORTCUT, object_at};
+    use serde_json::json;
 
     #[test]
-    fn reads_transcript_completed_after_capture() {
-        let connection = Connection::open_in_memory().unwrap();
-        connection
-            .execute_batch(
-                r#"CREATE TABLE History (
-                       timestamp TEXT,
-                       pastedText TEXT,
-                       formattedText TEXT,
-                       serverFinalizedText TEXT,
-                       asrText TEXT,
-                       app TEXT,
-                       transcriptCommand TEXT,
-                       status TEXT
-                   );
-                   INSERT INTO History VALUES
-                       ('2026-08-26 20:00:00.000 +00:00', 'old', NULL, NULL, NULL, 'com.cmuxterm.app', 'ptt', 'formatted'),
-                       ('2026-08-26 20:00:02.000 +00:00', 'Open Netflix.', NULL, NULL, NULL, 'com.cmuxterm.app', 'ptt', 'recording'),
-                       ('2026-08-26 20:00:03.000 +00:00', 'wrong app', NULL, NULL, NULL, 'com.apple.Notes', 'ptt', 'formatted');"#,
-            )
-            .unwrap();
-
-        let rowid = checkpoint(&connection).unwrap();
-        connection
-            .execute(
-                "UPDATE History SET status = 'formatted' WHERE pastedText = 'Open Netflix.'",
-                [],
-            )
-            .unwrap();
-
-        assert_eq!(
-            latest_after(&connection, rowid).unwrap().as_deref(),
-            Some("Open Netflix.")
-        );
-    }
-
-    #[test]
-    fn falls_back_to_timestamp_when_capture_was_unavailable() {
-        let connection = Connection::open_in_memory().unwrap();
-        connection
-            .execute_batch(
-                r#"CREATE TABLE History (
-                       timestamp TEXT,
-                       pastedText TEXT,
-                       formattedText TEXT,
-                       serverFinalizedText TEXT,
-                       asrText TEXT,
-                       app TEXT,
-                       transcriptCommand TEXT,
-                       status TEXT
-                   );
-                   INSERT INTO History VALUES
-                       ('2026-08-26 20:00:00.000 +00:00', 'old', NULL, NULL, NULL, 'com.cmuxterm.app', 'ptt', 'formatted'),
-                       ('2026-08-26 20:00:02.000 +00:00', 'Open Netflix.', NULL, NULL, NULL, 'com.cmuxterm.app', 'ptt', 'formatted');"#,
-            )
-            .unwrap();
-
-        let started = 1_787_774_401.0;
-        assert_eq!(
-            latest_since(&connection, started).unwrap().as_deref(),
-            Some("Open Netflix.")
-        );
+    fn routes_only_function_control_to_push_to_talk() {
+        let mut config = json!({"prefs":{"user":{"shortcuts":{"63":"ptt"}}}});
+        object_at(&mut config, &["prefs", "user", "shortcuts"])
+            .unwrap()
+            .insert(FLOW_SHORTCUT.into(), FLOW_PTT.into());
+        assert_eq!(config["prefs"]["user"]["shortcuts"]["63"], "ptt");
+        assert_eq!(config["prefs"]["user"]["shortcuts"]["59+63"], "ptt",);
     }
 }

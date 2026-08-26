@@ -12,6 +12,10 @@ const DESIGNATED_REQUIREMENT: &str = "=designated => identifier \"com.dineshteja
 const START_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub fn install(binary: &Path) -> io::Result<()> {
+    with_wispr_stopped(|| install_stopped(binary))
+}
+
+fn install_stopped(binary: &Path) -> io::Result<()> {
     let home = home()?;
     let agents = home.join("Library/LaunchAgents");
     let state = home.join("Library/Application Support/fx-line");
@@ -23,6 +27,7 @@ pub fn install(binary: &Path) -> io::Result<()> {
     fs::create_dir_all(&agents)?;
     fs::create_dir_all(&state)?;
     fs::create_dir_all(app_binary.parent().expect("app binary has a parent"))?;
+    crate::wispr::install(&home)?;
     let _ = Command::new("/bin/launchctl")
         .args(["bootout", &service])
         .output();
@@ -67,6 +72,10 @@ pub fn install(binary: &Path) -> io::Result<()> {
 }
 
 pub fn uninstall() -> io::Result<()> {
+    with_wispr_stopped(uninstall_stopped)
+}
+
+fn uninstall_stopped() -> io::Result<()> {
     let home = home()?;
     let app = home.join("Applications").join(APP_NAME);
     let app_binary = app.join("Contents/MacOS/fx-agent");
@@ -76,11 +85,22 @@ pub fn uninstall() -> io::Result<()> {
         .args(["bootout", &service])
         .output();
     stop(&app_binary)?;
+    crate::wispr::uninstall(&home)?;
     remove_file(plist)?;
     match fs::remove_dir_all(app) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error),
+    }
+}
+
+fn with_wispr_stopped(operation: impl FnOnce() -> io::Result<()>) -> io::Result<()> {
+    let restart = crate::wispr::stop_if_running()?;
+    let result = operation();
+    let restart_result = restart.then(crate::wispr::start).transpose();
+    match (result, restart_result) {
+        (Err(error), _) | (Ok(()), Err(error)) => Err(error),
+        (Ok(()), Ok(_)) => Ok(()),
     }
 }
 

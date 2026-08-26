@@ -1,3 +1,4 @@
+use crate::{agent::Event, capture};
 use core_foundation::{
     base::{CFType, TCFType},
     date::CFDate,
@@ -28,6 +29,7 @@ use std::{
     sync::{
         Arc,
         atomic::{AtomicU8, Ordering},
+        mpsc::Sender,
     },
 };
 
@@ -35,7 +37,8 @@ const CMUX_BUNDLE_ID: &str = "com.cmuxterm.app";
 const HEIGHT: f64 = 24.0;
 const RIGHT_INSET: f64 = 12.0;
 const TOP_INSET: f64 = 3.0;
-const POSITION_TICKS: u8 = 8;
+const REFRESH_INTERVAL: f64 = 0.02;
+const POSITION_TICKS: u8 = 20;
 
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -76,31 +79,41 @@ impl Phase {
     }
 }
 
-#[derive(Default)]
-struct Shared {
-    phase: AtomicU8,
-}
-
 #[derive(Clone, Default)]
-pub struct Handle(Arc<Shared>);
+pub struct Handle {
+    phase: Arc<AtomicU8>,
+    capture: capture::Handle,
+}
 
 impl Handle {
     pub fn set(&self, phase: Phase) {
-        self.0.phase.store(phase as u8, Ordering::Release);
+        self.phase.store(phase as u8, Ordering::Release);
     }
 
     fn get(&self) -> Phase {
-        Phase::from_raw(self.0.phase.load(Ordering::Acquire))
+        Phase::from_raw(self.phase.load(Ordering::Acquire))
+    }
+
+    pub fn request_capture(&self) -> bool {
+        self.capture.request()
+    }
+
+    pub fn cancel_capture(&self) {
+        self.capture.cancel();
+    }
+
+    pub fn paste_capture(&self) {
+        self.capture.paste();
     }
 }
 
-pub fn run(handle: Handle) -> io::Result<()> {
+pub fn run(handle: Handle, sender: Sender<Event>) -> io::Result<()> {
     let mtm = MainThreadMarker::new()
         .ok_or_else(|| io::Error::other("the CMUX indicator must run on the main thread"))?;
     let application = NSApplication::sharedApplication(mtm);
     application.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
 
-    let mut indicator = Box::new(Indicator::new(mtm, handle));
+    let mut indicator = Box::new(Indicator::new(mtm, handle, sender));
     let mut context = CFRunLoopTimerContext {
         version: 0,
         info: (&mut *indicator as *mut Indicator).cast(),
@@ -108,7 +121,14 @@ pub fn run(handle: Handle) -> io::Result<()> {
         release: None,
         copyDescription: None,
     };
-    let timer = CFRunLoopTimer::new(CFDate::now().abs_time(), 0.05, 0, 0, refresh, &mut context);
+    let timer = CFRunLoopTimer::new(
+        CFDate::now().abs_time(),
+        REFRESH_INTERVAL,
+        0,
+        0,
+        refresh,
+        &mut context,
+    );
     let run_loop = CFRunLoop::get_current();
     unsafe { run_loop.add_timer(&timer, kCFRunLoopCommonModes) };
     application.run();
@@ -118,14 +138,16 @@ pub fn run(handle: Handle) -> io::Result<()> {
 struct Indicator {
     panel: Retained<NSPanel>,
     label: Retained<NSTextField>,
+    capture: capture::Target,
     handle: Handle,
     phase: Option<Phase>,
     ticks: u8,
     width: f64,
+    target: Option<WindowFrame>,
 }
 
 impl Indicator {
-    fn new(mtm: MainThreadMarker, handle: Handle) -> Self {
+    fn new(mtm: MainThreadMarker, handle: Handle, sender: Sender<Event>) -> Self {
         let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(58.0, HEIGHT));
         let panel = NSPanel::initWithContentRect_styleMask_backing_defer(
             NSPanel::alloc(mtm),
@@ -160,14 +182,17 @@ impl Indicator {
         Self {
             panel,
             label,
+            capture: capture::Target::new(mtm, sender),
             handle,
             phase: None,
             ticks: POSITION_TICKS,
             width: 58.0,
+            target: None,
         }
     }
 
     fn refresh(&mut self) {
+        self.capture.refresh(&self.handle.capture);
         let phase = self.handle.get();
         if self.phase != Some(phase) {
             self.set_phase(phase);
@@ -180,7 +205,14 @@ impl Indicator {
         }
         self.ticks = 0;
 
-        let Some(target) = cmux_window_frame() else {
+        if let Some(target) = cmux_window_frame() {
+            self.target = Some(target);
+        }
+        let Some(target) = self
+            .target
+            .as_ref()
+            .filter(|_| cmux_is_frontmost() || self.capture.is_active() || phase != Phase::Ready)
+        else {
             self.panel.orderOut(None);
             return;
         };
@@ -222,10 +254,18 @@ extern "C" fn refresh(_timer: CFRunLoopTimerRef, info: *mut c_void) {
     });
 }
 
+#[derive(Clone, Copy)]
 struct WindowFrame {
     x: f64,
     y: f64,
     width: f64,
+}
+
+fn cmux_is_frontmost() -> bool {
+    NSWorkspace::sharedWorkspace()
+        .frontmostApplication()
+        .and_then(|application| application.bundleIdentifier())
+        .is_some_and(|bundle| bundle.to_string() == CMUX_BUNDLE_ID)
 }
 
 fn cmux_window_frame() -> Option<WindowFrame> {
