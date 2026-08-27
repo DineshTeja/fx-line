@@ -1,19 +1,11 @@
-use crate::{agent::Event, capture};
+mod window;
+
+use self::window::{WindowFrame, cmux_is_frontmost, cmux_window_frame};
+use super::{capture, daemon::Event};
 use core_foundation::{
-    base::{CFType, TCFType},
     date::CFDate,
-    dictionary::CFDictionary,
-    number::CFNumber,
     runloop::{
         CFRunLoop, CFRunLoopTimer, CFRunLoopTimerContext, CFRunLoopTimerRef, kCFRunLoopCommonModes,
-    },
-    string::CFString,
-};
-use core_graphics::{
-    geometry::CGRect,
-    window::{
-        copy_window_info, kCGNullWindowID, kCGWindowBounds, kCGWindowLayer,
-        kCGWindowListExcludeDesktopElements, kCGWindowListOptionOnScreenOnly, kCGWindowOwnerPID,
     },
 };
 use objc2::{MainThreadMarker, MainThreadOnly, rc::Retained, rc::autoreleasepool};
@@ -21,7 +13,7 @@ use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSColor,
     NSFloatingWindowLevel, NSFont, NSFontWeightSemibold, NSImage, NSImageSymbolConfiguration,
     NSImageView, NSPanel, NSTextAlignment, NSTextField, NSView, NSWindowAnimationBehavior,
-    NSWindowCollectionBehavior, NSWindowStyleMask, NSWorkspace,
+    NSWindowCollectionBehavior, NSWindowStyleMask,
 };
 use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
 use std::{
@@ -338,55 +330,4 @@ extern "C" fn refresh(_timer: CFRunLoopTimerRef, info: *mut c_void) {
         // and this timer only runs on the main thread.
         unsafe { (&mut *info.cast::<Indicator>()).refresh() };
     });
-}
-
-#[derive(Clone, Copy)]
-struct WindowFrame {
-    x: f64,
-    y: f64,
-    width: f64,
-}
-
-fn cmux_is_frontmost() -> bool {
-    NSWorkspace::sharedWorkspace()
-        .frontmostApplication()
-        .and_then(|application| application.bundleIdentifier())
-        .is_some_and(|bundle| bundle.to_string() == CMUX_BUNDLE_ID)
-}
-
-fn cmux_window_frame() -> Option<WindowFrame> {
-    let application = NSWorkspace::sharedWorkspace().frontmostApplication()?;
-    if application.bundleIdentifier()?.to_string() != CMUX_BUNDLE_ID {
-        return None;
-    }
-    let pid = i64::from(application.processIdentifier());
-    let windows = copy_window_info(
-        kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements,
-        kCGNullWindowID,
-    )?;
-    let pid_key = unsafe { CFString::wrap_under_get_rule(kCGWindowOwnerPID) };
-    let layer_key = unsafe { CFString::wrap_under_get_rule(kCGWindowLayer) };
-    let bounds_key = unsafe { CFString::wrap_under_get_rule(kCGWindowBounds) };
-
-    windows.iter().find_map(|value| {
-        let dictionary = unsafe {
-            CFDictionary::<CFString, CFType>::wrap_under_get_rule(
-                *value as core_foundation::dictionary::CFDictionaryRef,
-            )
-        };
-        if number(&dictionary, &pid_key)? != pid || number(&dictionary, &layer_key)? != 0 {
-            return None;
-        }
-        let bounds = dictionary.find(&bounds_key)?.downcast::<CFDictionary>()?;
-        let bounds = CGRect::from_dict_representation(&bounds)?;
-        (bounds.size.width >= 200.0 && bounds.size.height >= 100.0).then_some(WindowFrame {
-            x: bounds.origin.x,
-            y: bounds.origin.y,
-            width: bounds.size.width,
-        })
-    })
-}
-
-fn number(dictionary: &CFDictionary<CFString, CFType>, key: &CFString) -> Option<i64> {
-    dictionary.find(key)?.downcast::<CFNumber>()?.to_i64()
 }

@@ -1,11 +1,11 @@
 use crate::cmux::{Action, Direction};
 
-pub struct Intent {
-    pub action: Action,
-    pub message: String,
+pub(super) struct Intent {
+    pub(super) action: Action,
+    pub(super) message: String,
 }
 
-pub fn parse(request: &str) -> Option<Intent> {
+pub(super) fn parse(request: &str) -> Option<Intent> {
     let request = request.trim().trim_end_matches(['.', '!', '?']);
     if request.eq_ignore_ascii_case("flash") {
         return Some(Intent {

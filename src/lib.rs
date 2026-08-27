@@ -1,15 +1,9 @@
 pub mod agent;
+mod cmux;
+pub mod line;
+mod model;
 #[cfg(target_os = "macos")]
-mod capture;
-pub mod cmux;
-pub mod context;
-pub mod fx;
-pub mod intent;
-pub mod output;
-pub mod service;
-pub mod wispr;
+mod platform;
+mod project;
 
-#[cfg(target_os = "macos")]
-pub mod hotkey;
-#[cfg(target_os = "macos")]
-pub mod indicator;
+pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;

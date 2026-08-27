@@ -26,7 +26,7 @@ fn run() -> Result<()> {
         return Err(io::Error::other("too many arguments").into());
     }
 
-    let command = fx_line::fx::generate(&request, &cwd, &current_line)?;
+    let command = fx_line::line::generate(&request, &cwd, &current_line)?;
     write!(io::stdout().lock(), "{command}")?;
     Ok(())
 }

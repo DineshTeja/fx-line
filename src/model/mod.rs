@@ -1,6 +1,8 @@
+pub(crate) mod response;
+
+use crate::Result;
 use std::{
     env,
-    error::Error,
     ffi::OsString,
     fs,
     io::{self, Read, Write},
@@ -13,27 +15,10 @@ use std::{
 const DEFAULT_AGENT_MODEL: &str = "zai/glm-4.7-flash";
 const DEFAULT_LINE_MODEL: &str = "zai/glm-4.7-flash";
 const DEFAULT_PLAN_MODEL: &str = "zai/glm-4.7-flash";
-const MAX_ATTEMPTS: usize = 2;
 const LINE_TIMEOUT: Duration = Duration::from_secs(5);
 const AGENT_TIMEOUT: Duration = Duration::from_secs(20);
 
-type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
-
-pub fn generate(request: &str, cwd: &str, current_line: &str) -> Result<String> {
-    let prompt = line_prompt(request, cwd, current_line);
-    let mut last_error = None;
-
-    for _ in 0..MAX_ATTEMPTS {
-        match complete(&prompt).and_then(|output| Ok(crate::output::command(&output)?)) {
-            Ok(command) => return Ok(command),
-            Err(error) => last_error = Some(error),
-        }
-    }
-
-    Err(last_error.expect("at least one fx attempt"))
-}
-
-pub fn complete(prompt: &str) -> Result<String> {
+pub(crate) fn complete(prompt: &str) -> Result<String> {
     request(
         prompt,
         None,
@@ -44,7 +29,7 @@ pub fn complete(prompt: &str) -> Result<String> {
     )
 }
 
-pub fn plan(prompt: &str) -> Result<String> {
+pub(crate) fn plan(prompt: &str) -> Result<String> {
     request(
         prompt,
         None,
@@ -57,7 +42,7 @@ pub fn plan(prompt: &str) -> Result<String> {
     )
 }
 
-pub fn run_agent(prompt: &str, cwd: &Path) -> Result<String> {
+pub(crate) fn run_agent(prompt: &str, cwd: &Path) -> Result<String> {
     request(prompt, Some(cwd), agent_model(), "auto", 8, AGENT_TIMEOUT)
 }
 
@@ -137,7 +122,7 @@ fn request(
         return Err(io::Error::other(detail.unwrap_or("fx failed")).into());
     }
 
-    Ok(crate::output::envelope(&stdout)?)
+    Ok(response::envelope(&stdout)?)
 }
 
 fn runtime_path() -> OsString {
@@ -179,20 +164,6 @@ fn binary() -> OsString {
         .find(|path| path.is_file())
         .map(PathBuf::into_os_string)
         .unwrap_or_else(|| "fx".into())
-}
-
-fn line_prompt(request: &str, cwd: &str, current_line: &str) -> String {
-    let directory = crate::context::directory(Path::new(cwd));
-    let context = serde_json::json!({
-        "request": request,
-        "cwd": cwd,
-        "current_line": current_line,
-        "directory": directory,
-    });
-
-    format!(
-        "Return one macOS zsh command without using tools. The shell is already at cwd. Reply only with JSON: {{\"command\":\"...\"}}.\n{context}"
-    )
 }
 
 fn read_in_background<R>(mut reader: R) -> io::Result<JoinHandle<io::Result<Vec<u8>>>>
@@ -250,22 +221,5 @@ impl Workspace {
 impl Drop for Workspace {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.0);
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::line_prompt;
-
-    #[test]
-    fn prompt_encodes_directory_context_as_data() {
-        let prompt = line_prompt("find \"notes\"", "/missing/a b", "git ");
-        let (_, context) = prompt.split_once('\n').unwrap();
-        let context: serde_json::Value = serde_json::from_str(context).unwrap();
-
-        assert_eq!(context["request"], "find \"notes\"");
-        assert_eq!(context["cwd"], "/missing/a b");
-        assert_eq!(context["current_line"], "git ");
-        assert_eq!(context["directory"]["entries"], serde_json::json!([]));
     }
 }

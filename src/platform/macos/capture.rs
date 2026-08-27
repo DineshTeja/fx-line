@@ -1,4 +1,4 @@
-use crate::agent::Event;
+use super::daemon::Event;
 use objc2::{MainThreadMarker, MainThreadOnly, rc::Retained};
 use objc2_app_kit::{
     NSAccessibility, NSApplication, NSApplicationActivationOptions, NSBackingStoreType, NSColor,

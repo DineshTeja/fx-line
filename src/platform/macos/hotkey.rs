@@ -1,4 +1,5 @@
-use crate::{agent::Event, indicator::Handle as Indicator};
+use super::{daemon::Event, indicator::Handle as Indicator};
+use crate::Result;
 use core_foundation::runloop::CFRunLoop;
 use core_graphics::event::{
     CGEvent, CGEventFlags, CGEventTap, CGEventTapLocation, CGEventTapOptions, CGEventTapPlacement,
@@ -52,10 +53,7 @@ pub fn request_access() {
     }
 }
 
-pub fn listen(
-    sender: Sender<Event>,
-    indicator: Indicator,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+pub fn listen(sender: Sender<Event>, indicator: Indicator) -> Result<()> {
     let state = Arc::new(Mutex::new(State::default()));
     let modifier_state = Arc::clone(&state);
     let modifier_sender = sender.clone();

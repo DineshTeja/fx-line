@@ -27,7 +27,7 @@ fn install_stopped(binary: &Path) -> io::Result<()> {
     fs::create_dir_all(&agents)?;
     fs::create_dir_all(&state)?;
     fs::create_dir_all(app_binary.parent().expect("app binary has a parent"))?;
-    crate::wispr::install(&home)?;
+    super::wispr::install(&home)?;
     let _ = Command::new("/bin/launchctl")
         .args(["bootout", &service])
         .output();
@@ -85,7 +85,7 @@ fn uninstall_stopped() -> io::Result<()> {
         .args(["bootout", &service])
         .output();
     stop(&app_binary)?;
-    crate::wispr::uninstall(&home)?;
+    super::wispr::uninstall(&home)?;
     remove_file(plist)?;
     match fs::remove_dir_all(app) {
         Ok(()) => Ok(()),
@@ -95,9 +95,9 @@ fn uninstall_stopped() -> io::Result<()> {
 }
 
 fn with_wispr_stopped(operation: impl FnOnce() -> io::Result<()>) -> io::Result<()> {
-    let restart = crate::wispr::stop_if_running()?;
+    let restart = super::wispr::stop_if_running()?;
     let result = operation();
-    let restart_result = restart.then(crate::wispr::start).transpose();
+    let restart_result = restart.then(super::wispr::start).transpose();
     match (result, restart_result) {
         (Err(error), _) | (Ok(()), Err(error)) => Err(error),
         (Ok(()), Ok(_)) => Ok(()),

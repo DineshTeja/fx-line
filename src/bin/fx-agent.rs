@@ -35,14 +35,14 @@ fn run() -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
             Ok(Some(fx_line::agent::run_request(&request)?))
         }
         "install" if args.next().is_none() => {
-            fx_line::service::install(&env::current_exe()?)?;
+            fx_line::agent::install(&env::current_exe()?)?;
             Ok(Some("fx-agent is running".into()))
         }
         "uninstall" if args.next().is_none() => {
-            fx_line::service::uninstall()?;
+            fx_line::agent::uninstall()?;
             Ok(Some("fx-agent was removed".into()))
         }
-        "status" if args.next().is_none() => Ok(Some(if fx_line::service::is_running()? {
+        "status" if args.next().is_none() => Ok(Some(if fx_line::agent::is_running()? {
             "running".into()
         } else {
             "stopped".into()

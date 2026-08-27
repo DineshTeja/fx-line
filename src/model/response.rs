@@ -5,7 +5,7 @@ use std::{error::Error, fmt};
 const MAX_COMMAND_BYTES: usize = 8_192;
 
 #[derive(Debug)]
-pub struct InvalidResponse(&'static str);
+pub(crate) struct InvalidResponse(&'static str);
 
 impl fmt::Display for InvalidResponse {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -15,7 +15,7 @@ impl fmt::Display for InvalidResponse {
 
 impl Error for InvalidResponse {}
 
-pub fn envelope(raw: &str) -> Result<String, InvalidResponse> {
+pub(crate) fn envelope(raw: &str) -> Result<String, InvalidResponse> {
     let envelope: Value =
         serde_json::from_str(raw).map_err(|_| InvalidResponse("fx returned invalid JSON"))?;
     if envelope.get("exit_code").and_then(Value::as_i64) != Some(0) {
@@ -29,7 +29,7 @@ pub fn envelope(raw: &str) -> Result<String, InvalidResponse> {
         .ok_or(InvalidResponse("fx returned no output"))
 }
 
-pub fn command(output: &str) -> Result<String, InvalidResponse> {
+pub(crate) fn command(output: &str) -> Result<String, InvalidResponse> {
     let command = one_line(&json::<Command>(output)?.command);
     let command = command.trim();
 
@@ -46,7 +46,7 @@ pub fn command(output: &str) -> Result<String, InvalidResponse> {
     Ok(command.into())
 }
 
-pub fn json<T: DeserializeOwned>(output: &str) -> Result<T, InvalidResponse> {
+pub(crate) fn json<T: DeserializeOwned>(output: &str) -> Result<T, InvalidResponse> {
     let output = unfence(output);
     if let Ok(value) = serde_json::from_str(output) {
         return Ok(value);

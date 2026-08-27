@@ -5,13 +5,13 @@ const MAX_ENTRIES: usize = 48;
 const MAX_SCANNED_ENTRIES: usize = 512;
 
 #[derive(Debug, Serialize)]
-pub struct DirectoryContext {
+pub(crate) struct DirectoryContext {
     entries: Vec<String>,
     git_branch: Option<String>,
     git_root: Option<String>,
 }
 
-pub fn directory(path: &Path) -> DirectoryContext {
+pub(crate) fn directory(path: &Path) -> DirectoryContext {
     let mut entries = fs::read_dir(path)
         .into_iter()
         .flatten()

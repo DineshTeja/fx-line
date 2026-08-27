@@ -1,11 +1,11 @@
 mod actions;
 mod validation;
 
-pub use actions::{Action, Direction};
+use crate::Result;
+pub(crate) use actions::{Action, Direction};
 use serde::{Deserialize, Serialize};
 use std::{
     env,
-    error::Error,
     ffi::OsString,
     io,
     path::PathBuf,
@@ -13,8 +13,6 @@ use std::{
 };
 
 const STATUS_KEY: &str = "voice-agent";
-
-type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 
 #[derive(Clone, Debug, Serialize)]
 pub struct Context {
