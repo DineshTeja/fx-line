@@ -19,8 +19,9 @@ use core_graphics::{
 use objc2::{MainThreadMarker, MainThreadOnly, rc::Retained, rc::autoreleasepool};
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSColor,
-    NSFloatingWindowLevel, NSFont, NSPanel, NSTextAlignment, NSTextField,
-    NSWindowAnimationBehavior, NSWindowCollectionBehavior, NSWindowStyleMask, NSWorkspace,
+    NSFloatingWindowLevel, NSFont, NSFontWeightSemibold, NSImage, NSImageSymbolConfiguration,
+    NSImageView, NSPanel, NSTextAlignment, NSTextField, NSView, NSWindowAnimationBehavior,
+    NSWindowCollectionBehavior, NSWindowStyleMask, NSWorkspace,
 };
 use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
 use std::{
@@ -34,9 +35,14 @@ use std::{
 };
 
 const CMUX_BUNDLE_ID: &str = "com.cmuxterm.app";
-const HEIGHT: f64 = 24.0;
+const HEIGHT: f64 = 28.0;
 const RIGHT_INSET: f64 = 12.0;
-const TOP_INSET: f64 = 3.0;
+const TOP_INSET: f64 = 0.0;
+const FONT_SIZE: f64 = 12.5;
+const ICON_FRAME: f64 = 13.0;
+const ICON_SPACING: f64 = 5.0;
+const HORIZONTAL_PADDING: f64 = 2.0;
+const TEXT_VERTICAL_NUDGE: f64 = -1.5;
 const REFRESH_INTERVAL: f64 = 0.02;
 const POSITION_TICKS: u8 = 20;
 
@@ -66,15 +72,54 @@ impl Phase {
         }
     }
 
-    fn presentation(self) -> (&'static str, f64, Retained<NSColor>) {
+    fn presentation(self) -> Presentation {
         match self {
-            Self::Off => ("○ Off", 48.0, NSColor::systemGrayColor()),
-            Self::Ready => ("● Ready", 58.0, NSColor::systemGrayColor()),
-            Self::Listening => ("● Listening", 76.0, NSColor::systemRedColor()),
-            Self::Transcribing => ("● Transcribing", 94.0, NSColor::systemOrangeColor()),
-            Self::Working => ("● Working", 70.0, NSColor::systemBlueColor()),
-            Self::Done => ("✓ Done", 54.0, NSColor::systemGreenColor()),
-            Self::Error => ("! Error", 50.0, NSColor::systemRedColor()),
+            Self::Off => Presentation::new("Off", "circle", 7.0, Tone::Muted),
+            Self::Ready => Presentation::new("Ready", "circle.fill", 7.0, Tone::Muted),
+            Self::Listening => Presentation::new("Listening", "waveform", 11.0, Tone::Red),
+            Self::Transcribing => Presentation::new("Transcribing", "ellipsis", 10.0, Tone::Orange),
+            Self::Working => Presentation::new("Working", "sparkles", 10.0, Tone::Blue),
+            Self::Done => Presentation::new("Done", "checkmark", 10.0, Tone::Green),
+            Self::Error => Presentation::new("Error", "exclamationmark", 10.0, Tone::Red),
+        }
+    }
+}
+
+struct Presentation {
+    text: &'static str,
+    symbol: &'static str,
+    icon_size: f64,
+    tone: Tone,
+}
+
+impl Presentation {
+    const fn new(text: &'static str, symbol: &'static str, icon_size: f64, tone: Tone) -> Self {
+        Self {
+            text,
+            symbol,
+            icon_size,
+            tone,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Tone {
+    Muted,
+    Red,
+    Orange,
+    Blue,
+    Green,
+}
+
+impl Tone {
+    fn color(self) -> Retained<NSColor> {
+        match self {
+            Self::Muted => NSColor::tertiaryLabelColor(),
+            Self::Red => NSColor::systemRedColor(),
+            Self::Orange => NSColor::systemOrangeColor(),
+            Self::Blue => NSColor::systemBlueColor(),
+            Self::Green => NSColor::systemGreenColor(),
         }
     }
 }
@@ -137,6 +182,7 @@ pub fn run(handle: Handle, sender: Sender<Event>) -> io::Result<()> {
 
 struct Indicator {
     panel: Retained<NSPanel>,
+    icon: Retained<NSImageView>,
     label: Retained<NSTextField>,
     capture: capture::Target,
     handle: Handle,
@@ -148,7 +194,7 @@ struct Indicator {
 
 impl Indicator {
     fn new(mtm: MainThreadMarker, handle: Handle, sender: Sender<Event>) -> Self {
-        let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(58.0, HEIGHT));
+        let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(64.0, HEIGHT));
         let panel = NSPanel::initWithContentRect_styleMask_backing_defer(
             NSPanel::alloc(mtm),
             frame,
@@ -173,20 +219,28 @@ impl Indicator {
                 | NSWindowCollectionBehavior::Transient,
         );
 
-        let label = NSTextField::labelWithString(&NSString::from_str("● Ready"), mtm);
-        label.setFrame(frame);
-        label.setAlignment(NSTextAlignment::Center);
-        label.setFont(Some(&NSFont::boldSystemFontOfSize(10.5)));
-        panel.setContentView(Some(&label));
+        let content = NSView::initWithFrame(NSView::alloc(mtm), frame);
+        let image = symbol("circle.fill").expect("macOS provides the circle SF Symbol");
+        let icon = NSImageView::imageViewWithImage(&image, mtm);
+        content.addSubview(&icon);
+
+        let label = NSTextField::labelWithString(&NSString::from_str("Ready"), mtm);
+        label.setAlignment(NSTextAlignment::Left);
+        label.setFont(Some(&NSFont::systemFontOfSize_weight(FONT_SIZE, unsafe {
+            NSFontWeightSemibold
+        })));
+        content.addSubview(&label);
+        panel.setContentView(Some(&content));
 
         Self {
             panel,
+            icon,
             label,
             capture: capture::Target::new(mtm, sender),
             handle,
             phase: None,
             ticks: POSITION_TICKS,
-            width: 58.0,
+            width: 64.0,
             target: None,
         }
     }
@@ -233,14 +287,46 @@ impl Indicator {
     }
 
     fn set_phase(&mut self, phase: Phase) {
-        let (text, width, color) = phase.presentation();
+        let presentation = phase.presentation();
+        let text_color = match phase {
+            Phase::Off | Phase::Ready => NSColor::secondaryLabelColor(),
+            _ => NSColor::labelColor(),
+        };
         self.phase = Some(phase);
-        self.width = width;
-        self.label.setStringValue(&NSString::from_str(text));
-        self.label.setTextColor(Some(&color));
-        let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(width, HEIGHT));
-        self.label.setFrame(frame);
+        self.label
+            .setStringValue(&NSString::from_str(presentation.text));
+        self.label.setTextColor(Some(&text_color));
+        self.label.sizeToFit();
+
+        if let Some(image) = symbol(presentation.symbol) {
+            self.icon.setImage(Some(&image));
+        }
+        let configuration = NSImageSymbolConfiguration::configurationWithPointSize_weight(
+            presentation.icon_size,
+            unsafe { NSFontWeightSemibold },
+        );
+        self.icon.setSymbolConfiguration(Some(&configuration));
+        self.icon
+            .setContentTintColor(Some(&presentation.tone.color()));
+
+        let icon_origin = NSPoint::new(HORIZONTAL_PADDING, ((HEIGHT - ICON_FRAME) / 2.0).round());
+        self.icon.setFrame(NSRect::new(
+            icon_origin,
+            NSSize::new(ICON_FRAME, ICON_FRAME),
+        ));
+
+        let label_size = self.label.frame().size;
+        let label_origin = NSPoint::new(
+            HORIZONTAL_PADDING + ICON_FRAME + ICON_SPACING,
+            ((HEIGHT - label_size.height) / 2.0 + TEXT_VERTICAL_NUDGE).round(),
+        );
+        self.label.setFrameOrigin(label_origin);
+        self.width = (label_origin.x + label_size.width + HORIZONTAL_PADDING).ceil();
     }
+}
+
+fn symbol(name: &str) -> Option<Retained<NSImage>> {
+    NSImage::imageWithSystemSymbolName_accessibilityDescription(&NSString::from_str(name), None)
 }
 
 extern "C" fn refresh(_timer: CFRunLoopTimerRef, info: *mut c_void) {
